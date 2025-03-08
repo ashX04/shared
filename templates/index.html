@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>File Server</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { max-width: 800px; margin: 0 auto; padding: 20px; }
+        .qr-code { text-align: center; margin: 20px 0; }
+        .file-list { margin: 20px 0; }
+        .file-item { padding: 10px; border-bottom: 1px solid #eee; }
+    </style>
+</head>
+<body>
+    <h1>File Server</h1>
+    
+    <div class="qr-code">
+        <h3>Scan to connect</h3>
+        <img src="/static/qr.png" alt="QR Code">
+        <div style="margin: 20px; padding: 10px; background: #f0f0f0; border-radius: 5px;">
+            <h4>Connection Instructions:</h4>
+            <p>1. Open Files app on iPhone</p>
+            <p>2. Click "Browse" → "More Locations" → "Connect to Server"</p>
+            <p>3. Enter: <code>http://<script>document.write(window.location.hostname)</script>:8080/webdav</code></p>
+            <p>4. Use these credentials:</p>
+            <p>Username: <code>admin</code></p>
+            <p>Password: <code>admin123</code></p>
+        </div>
+    </div>
+
+    <form action="/upload" method="post" enctype="multipart/form-data">
+        <input type="file" name="files" multiple>
+        <input type="submit" value="Upload">
+    </form>
+
+    <div class="file-list">
+        <h3>Files:</h3>
+        {{range .}}
+        <div class="file-item">
+            <a href="/files/{{.}}" target="_blank">{{.}}</a>
+        </div>
+        {{end}}
+    </div>
+</body>
+</html>
