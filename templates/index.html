@@ -850,11 +850,21 @@
                         body: JSON.stringify(Array.from(selectedItems))
                     });
 
-                    if (response.ok) {
-                        window.location.reload();
-                    } else {
-                        alert('Error deleting some items');
+                    const results = await response.json();
+                    
+                    let errorCount = 0;
+                    for (const [path, result] of Object.entries(results)) {
+                        if (result !== 'success') {
+                            errorCount++;
+                            console.error(`Error deleting ${path}: ${result}`);
+                        }
                     }
+
+                    if (errorCount > 0) {
+                        alert(`Failed to delete ${errorCount} items. Check console for details.`);
+                    }
+
+                    window.location.reload();
                 } catch (error) {
                     alert('Error deleting items');
                     console.error('Delete error:', error);

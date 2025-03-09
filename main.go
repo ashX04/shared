@@ -24,11 +24,11 @@ import (
 
 const (
     uploadDir = "./uploads"
-    maxWorkers = 20               // Increased from 10 to 20
+    maxWorkers = 50               // Increased from 10 to 20
     maxConcurrentUploads = 50     // New: Maximum concurrent upload handlers
     maxRetries = 3              // Maximum number of retry attempts
-    chunkSize = 16 * 1024 * 1024  // Increased from 8MB to 16MB chunks
-    bufferSize = 256 * 1024       // Increased from 32KB to 256KB buffer
+    chunkSize = 32 * 1024 * 1024  // Increased from 8MB to 16MB chunks
+    bufferSize = 512 * 1024       // Increased from 32KB to 256KB buffer
     tempDir = "./uploads/temp"   // Add temporary directory for chunks
     maxNetworkRetries = 3
     networkRetryDelay = 100 * time.Millisecond
@@ -282,13 +282,24 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
         TotalSize     int64
     }{}
 
-    for _, fi := range fileInfos {
-        if (fi.IsDir) {
-            stats.TotalFolders++
+    // Calculate stats including nested directories
+    err = filepath.Walk(fullPath, func(path string, info os.FileInfo, err error) error {
+        if err != nil {
+            return nil // Skip files we can't access
+        }
+        if info.IsDir() {
+            if path != fullPath { // Don't count current directory
+                stats.TotalFolders++
+            }
         } else {
             stats.TotalFiles++
-            stats.TotalSize += fi.Size
+            stats.TotalSize += info.Size()
         }
+        return nil
+    })
+
+    if err != nil {
+        log.Printf("Error calculating directory stats: %v", err)
     }
 
     viewData := ViewData{
@@ -834,14 +845,16 @@ func handleBatchDelete(w http.ResponseWriter, r *http.Request) {
     }
 
     var paths []string
-    if err := json.NewDecoder(r.Body).Decode(&paths); err != nil {
-        http.Error(w, "Invalid request", http.StatusBadRequest)
+    err := json.NewDecoder(r.Body).Decode(&paths)
+    if err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
         return
     }
 
     results := make(map[string]string)
     for _, path := range paths {
-        fullPath := filepath.Join(uploadDir, path)
+        cleanPath := filepath.Clean(path)
+        fullPath := filepath.Join(uploadDir, cleanPath)
         
         // Validate path
         absUploadDir, _ := filepath.Abs(uploadDir)
@@ -853,21 +866,30 @@ func handleBatchDelete(w http.ResponseWriter, r *http.Request) {
 
         info, err := os.Stat(fullPath)
         if err != nil {
-            results[path] = "Not found"
+            results[path] = fmt.Sprintf("Not found: %v", err)
             continue
+        }
+
+        var size int64
+        if info.IsDir() {
+            size, _ = calculateDirSize(fullPath)
+        } else {
+            size = info.Size()
         }
 
         if err := os.RemoveAll(fullPath); err != nil {
-            results[path] = "Failed to delete"
+            results[path] = fmt.Sprintf("Failed to delete: %v", err)
             continue
         }
 
-        logOperation("DELETE", path, info.Size())
+        logOperation("DELETE", cleanPath, size)
         results[path] = "success"
     }
 
     w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(results)
+    if err := json.NewEncoder(w).Encode(results); err != nil {
+        log.Printf("Error encoding response: %v", err)
+    }
 }
 
 func getMimeType(filepath string) string {
@@ -970,4 +992,19 @@ func cleanupTempFiles() {
             }
         }
     }
+}
+
+// Add this new helper function
+func calculateDirSize(path string) (int64, error) {
+    var size int64
+    err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+        if err != nil {
+            return err
+        }
+        if !info.IsDir() {
+            size += info.Size()
+        }
+        return nil
+    })
+    return size, err
 }
