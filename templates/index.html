@@ -3,42 +3,262 @@
 <head>
     <title>File Server</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
-        body { max-width: 800px; margin: 0 auto; padding: 20px; }
-        .qr-code { text-align: center; margin: 20px 0; }
-        .file-list { margin: 20px 0; }
-        .file-item { padding: 10px; border-bottom: 1px solid #eee; }
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .explorer {
+            display: grid;
+            grid-template-rows: auto 1fr;
+            height: 100vh;
+        }
+        .toolbar {
+            background: #f0f0f0;
+            padding: 8px;
+            border-bottom: 1px solid #ddd;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .view-toggle {
+            padding: 5px 10px;
+            cursor: pointer;
+            border: none;
+            background: none;
+        }
+        .view-toggle.active {
+            background: #e0e0e0;
+            border-radius: 3px;
+        }
+        .files-container {
+            padding: 20px;
+            overflow: auto;
+        }
+        .files-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+            gap: 20px;
+        }
+        .files-list {
+            display: table;
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .list-header {
+            display: table-header-group;
+            background: #f5f5f5;
+        }
+        .list-header > div {
+            display: table-cell;
+            padding: 8px;
+            font-weight: bold;
+            border-bottom: 1px solid #ddd;
+        }
+        .file-item {
+            cursor: pointer;
+            padding: 8px;
+            text-align: center;
+        }
+        .file-item:hover {
+            background: #f0f5ff;
+        }
+        .file-item.list-view {
+            display: table-row;
+        }
+        .file-item.list-view > div {
+            display: table-cell;
+            padding: 8px;
+            vertical-align: middle;
+            border-bottom: 1px solid #eee;
+        }
+        .file-icon {
+            font-size: 32px;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        .file-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .context-menu {
+            position: fixed;
+            background: white;
+            border: 1px solid #ddd;
+            box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
+            padding: 5px 0;
+            z-index: 1000;
+        }
+        .context-menu-item {
+            padding: 5px 20px;
+            cursor: pointer;
+        }
+        .context-menu-item:hover {
+            background: #f0f5ff;
+        }
+        .upload-zone {
+            border: 2px dashed #ccc;
+            border-radius: 5px;
+            padding: 20px;
+            text-align: center;
+            background: #f9f9f9;
+            margin-bottom: 20px;
+        }
+        .upload-zone.drag-over {
+            background: #f0f5ff;
+            border-color: #66a6ff;
+        }
     </style>
 </head>
 <body>
-    <h1>File Server</h1>
-    
-    <div class="qr-code">
-        <h3>Scan to connect</h3>
-        <img src="/static/qr.png" alt="QR Code">
-        <div style="margin: 20px; padding: 10px; background: #f0f0f0; border-radius: 5px;">
-            <h4>Connection Instructions:</h4>
-            <p>1. Open Files app on iPhone</p>
-            <p>2. Click "Browse" → "More Locations" → "Connect to Server"</p>
-            <p>3. Enter: <code>http://<script>document.write(window.location.hostname)</script>:8080/webdav</code></p>
-            <p>4. Use these credentials:</p>
-            <p>Username: <code>admin</code></p>
-            <p>Password: <code>admin123</code></p>
+    <div class="explorer">
+        <div class="toolbar">
+            <button class="view-toggle" data-view="grid">
+                <i class="fas fa-th-large"></i> Grid
+            </button>
+            <button class="view-toggle" data-view="list">
+                <i class="fas fa-list"></i> List
+            </button>
+        </div>
+
+        <div class="files-container">
+            <div class="upload-zone" id="dropZone">
+                <i class="fas fa-cloud-upload-alt"></i>
+                <p>Drag and drop files here or click to upload</p>
+                <form id="uploadForm" action="/upload" method="post" enctype="multipart/form-data">
+                    <input type="file" name="files" multiple style="display: none" id="fileInput">
+                </form>
+            </div>
+
+            <div class="files-list" style="display: none;">
+                <div class="list-header">
+                    <div>Name</div>
+                    <div>Type</div>
+                    <div>Size</div>
+                    <div>Modified</div>
+                </div>
+                {{range .}}
+                <div class="file-item list-view" data-file="{{.Name}}">
+                    <div>
+                        <i class="{{getFileIcon .MimeType}}"></i>
+                        {{.Name}}
+                    </div>
+                    <div>{{.MimeType}}</div>
+                    <div>{{formatSize .Size}}</div>
+                    <div>{{formatTime .ModTime}}</div>
+                </div>
+                {{end}}
+            </div>
+
+            <div class="files-grid">
+                {{range .}}
+                <div class="file-item grid-view" data-file="{{.Name}}">
+                    {{if .IsImage}}
+                        <img src="/files/{{.Name}}" alt="{{.Name}}" style="width: 64px; height: 64px; object-fit: cover;">
+                    {{else}}
+                        <i class="{{getFileIcon .MimeType}} file-icon"></i>
+                    {{end}}
+                    <div class="file-name">{{.Name}}</div>
+                </div>
+                {{end}}
+            </div>
         </div>
     </div>
 
-    <form action="/upload" method="post" enctype="multipart/form-data">
-        <input type="file" name="files" multiple>
-        <input type="submit" value="Upload">
-    </form>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const gridView = document.querySelector('.files-grid');
+            const listView = document.querySelector('.files-list');
+            const viewToggles = document.querySelectorAll('.view-toggle');
 
-    <div class="file-list">
-        <h3>Files:</h3>
-        {{range .}}
-        <div class="file-item">
-            <a href="/files/{{.}}" target="_blank">{{.}}</a>
-        </div>
-        {{end}}
-    </div>
+            // View toggle
+            viewToggles.forEach(toggle => {
+                toggle.addEventListener('click', () => {
+                    const view = toggle.dataset.view;
+                    viewToggles.forEach(t => t.classList.remove('active'));
+                    toggle.classList.add('active');
+                    
+                    if (view === 'grid') {
+                        gridView.style.display = 'grid';
+                        listView.style.display = 'none';
+                    } else {
+                        gridView.style.display = 'none';
+                        listView.style.display = 'table';
+                    }
+                });
+            });
+
+            // Context menu
+            let contextMenu = null;
+            document.addEventListener('contextmenu', (e) => {
+                const fileItem = e.target.closest('.file-item');
+                if (fileItem) {
+                    e.preventDefault();
+                    if (contextMenu) contextMenu.remove();
+                    
+                    const fileName = fileItem.dataset.file;
+                    contextMenu = document.createElement('div');
+                    contextMenu.className = 'context-menu';
+                    contextMenu.innerHTML = `
+                        <div class="context-menu-item" onclick="window.location='/files/${fileName}'">
+                            <i class="fas fa-download"></i> Download
+                        </div>
+                        <div class="context-menu-item" onclick="window.open('/files/${fileName}')">
+                            <i class="fas fa-external-link-alt"></i> Open
+                        </div>
+                    `;
+                    
+                    contextMenu.style.left = e.pageX + 'px';
+                    contextMenu.style.top = e.pageY + 'px';
+                    document.body.appendChild(contextMenu);
+                }
+            });
+
+            // Click outside to close context menu
+            document.addEventListener('click', () => {
+                if (contextMenu) contextMenu.remove();
+            });
+
+            // Drag and drop
+            const dropZone = document.getElementById('dropZone');
+            const fileInput = document.getElementById('fileInput');
+            const uploadForm = document.getElementById('uploadForm');
+
+            dropZone.addEventListener('click', () => fileInput.click());
+            
+            dropZone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                dropZone.classList.add('drag-over');
+            });
+
+            dropZone.addEventListener('dragleave', () => {
+                dropZone.classList.remove('drag-over');
+            });
+
+            dropZone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                dropZone.classList.remove('drag-over');
+                
+                const files = e.dataTransfer.files;
+                const formData = new FormData(uploadForm);
+                
+                for (let file of files) {
+                    formData.append('files', file);
+                }
+
+                fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                }).then(() => window.location.reload());
+            });
+
+            fileInput.addEventListener('change', () => {
+                uploadForm.submit();
+            });
+        });
+    </script>
 </body>
 </html>

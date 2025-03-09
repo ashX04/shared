@@ -4,95 +4,140 @@ import (
     "fmt"
     "html/template"
     "io"
+    "log"
+    "mime"
     "net"
     "net/http"
     "os"
     "path/filepath"
+    "strings"
+    "time"
     "github.com/skip2/go-qrcode"
-    "golang.org/x/net/webdav"
+    "path"
 )
 
-const (
-    uploadDir = "./uploads"
-    username  = "admin"    // You can change these credentials
-    password  = "admin123" // You can change these credentials
-)
+const uploadDir = "./uploads"
 
-type WebDAVHandler struct {
-    *webdav.Handler
+type FileInfo struct {
+    Name      string
+    Path      string
+    Size      int64
+    ModTime   time.Time
+    IsImage   bool
+    MimeType  string
 }
 
-func (h *WebDAVHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-    // Basic auth check
-    user, pass, ok := r.BasicAuth()
-    if !ok || user != username || pass != password {
-        w.Header().Set("WWW-Authenticate", `Basic realm="WebDAV"`)
-        http.Error(w, "Unauthorized", http.StatusUnauthorized)
-        return
+func init() {
+    // Configure logging
+    log.SetFlags(log.LstdFlags | log.Lshortfile)
+    f, err := os.OpenFile("server.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    if err == nil {
+        log.SetOutput(f)
     }
 
-    w.Header().Set("Access-Control-Allow-Origin", "*")
-    w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK")
-    w.Header().Set("Access-Control-Allow-Headers", "Depth, Authorization")
-    w.Header().Set("DAV", "1,2")
-    
-    if r.Method == "OPTIONS" {
-        return
-    }
-    
-    h.Handler.ServeHTTP(w, r)
+    // Add MIME type mapping for common file types
+    mime.AddExtensionType(".pdf", "application/pdf")
+    mime.AddExtensionType(".doc", "application/msword")
+    mime.AddExtensionType(".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    mime.AddExtensionType(".xls", "application/vnd.ms-excel")
+    mime.AddExtensionType(".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 }
 
 func main() {
-    // Create uploads directory if it doesn't exist
     os.MkdirAll(uploadDir, 0755)
-
-    // Get local IP address
-    ip := getLocalIP()
-    serverAddr := fmt.Sprintf("%s:8080", ip)
-    qrCodeURL := fmt.Sprintf("http://%s", serverAddr)
     
-    // Generate QR code
-    qrcode.WriteFile(qrCodeURL, qrcode.Medium, 256, "static/qr.png")
+    // Wrap handlers with logging middleware
+    http.Handle("/", logRequest(handleHome))
+    http.Handle("/upload", logRequest(handleUpload))
+    http.Handle("/files/", logRequest(handleFileServing))
+    http.Handle("/qr", logRequest(handleQR))
+    http.Handle("/dav/", logRequest(handleWebDAV))
+    
+    ip := getLocalIP()
+    port := ":8080"
+    fmt.Printf("Server running at http://%s%s\n", ip, port)
+    http.ListenAndServe(port, nil)
+}
 
-    // WebDAV handler
-    webdavHandler := &WebDAVHandler{
-        &webdav.Handler{
-            FileSystem: webdav.Dir(uploadDir),
-            LockSystem: webdav.NewMemLS(),
-        },
+func logRequest(next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        log.Printf("Started %s %s", r.Method, r.URL.Path)
+        next.ServeHTTP(w, r)
+        log.Printf("Completed %s %s in %v", r.Method, r.URL.Path, time.Since(start))
     }
-
-    // Routes
-    http.HandleFunc("/", handleHome)
-    http.HandleFunc("/upload", handleUpload)
-    http.Handle("/webdav/", http.StripPrefix("/webdav", webdavHandler))
-    http.Handle("/files/", http.StripPrefix("/files/", http.FileServer(http.Dir(uploadDir))))
-    http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
-
-    fmt.Printf("Server running at http://%s\n", serverAddr)
-    fmt.Printf("WebDAV URL: http://%s/webdav\n", serverAddr)
-    http.ListenAndServe(serverAddr, nil)
 }
 
 func handleHome(w http.ResponseWriter, r *http.Request) {
-    files, _ := filepath.Glob(filepath.Join(uploadDir, "*"))
-    fileNames := make([]string, 0)
-    for _, f := range files {
-        fileNames = append(fileNames, filepath.Base(f))
+    files, err := filepath.Glob(filepath.Join(uploadDir, "*"))
+    if err != nil {
+        log.Printf("Error reading files: %v", err)
+        http.Error(w, "Error reading files", http.StatusInternalServerError)
+        return
     }
-    
-    tmpl, _ := template.ParseFiles("templates/index.html")
-    tmpl.Execute(w, fileNames)
+
+    var fileInfos []FileInfo
+    for _, f := range files {
+        info, err := os.Stat(f)
+        if err != nil {
+            continue
+        }
+
+        mimeType := getMimeType(f)
+        fi := FileInfo{
+            Name:     path.Base(f),
+            Path:     f,
+            Size:     info.Size(),
+            ModTime:  info.ModTime(),
+            IsImage:  strings.HasPrefix(mimeType, "image/"),
+            MimeType: mimeType,
+        }
+        fileInfos = append(fileInfos, fi)
+    }
+
+    funcMap := template.FuncMap{
+        "basename": path.Base,
+        "formatSize": func(size int64) string {
+            return formatFileSize(size)
+        },
+        "formatTime": func(t time.Time) string {
+            return t.Format("2006-01-02 15:04:05")
+        },
+        "getFileIcon": func(mimeType string) string {
+            switch {
+            case strings.HasPrefix(mimeType, "image/"):
+                return "fas fa-image"
+            case strings.HasPrefix(mimeType, "video/"):
+                return "fas fa-video"
+            case strings.HasPrefix(mimeType, "audio/"):
+                return "fas fa-music"
+            case strings.Contains(mimeType, "pdf"):
+                return "fas fa-file-pdf"
+            case strings.Contains(mimeType, "word"):
+                return "fas fa-file-word"
+            case strings.Contains(mimeType, "excel"):
+                return "fas fa-file-excel"
+            case strings.Contains(mimeType, "zip") || strings.Contains(mimeType, "compressed"):
+                return "fas fa-file-archive"
+            default:
+                return "fas fa-file"
+            }
+        },
+    }
+
+    tmpl := template.Must(template.New("index.html").Funcs(funcMap).ParseFiles("templates/index.html"))
+    if err := tmpl.Execute(w, fileInfos); err != nil {
+        log.Printf("Template error: %v", err)
+    }
 }
 
 func handleUpload(w http.ResponseWriter, r *http.Request) {
     if r.Method != http.MethodPost {
-        http.Redirect(w, r, "/", http.StatusSeeOther)
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
         return
     }
 
-    r.ParseMultipartForm(32 << 20) // 32MB max memory
+    r.ParseMultipartForm(32 << 20)
     files := r.MultipartForm.File["files"]
 
     for _, fileHeader := range files {
@@ -101,11 +146,56 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
         dst, _ := os.Create(filepath.Join(uploadDir, fileHeader.Filename))
         defer dst.Close()
-
         io.Copy(dst, file)
     }
 
     http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func handleFileServing(w http.ResponseWriter, r *http.Request) {
+    fs := http.FileServer(http.Dir(uploadDir))
+    http.StripPrefix("/files/", fs).ServeHTTP(w, r)
+}
+
+func handleQR(w http.ResponseWriter, r *http.Request) {
+    ip := getLocalIP()
+    url := fmt.Sprintf("http://%s:8080", ip)
+    qr, _ := qrcode.Encode(url, qrcode.Medium, 256)
+    w.Header().Set("Content-Type", "image/png")
+    w.Write(qr)
+}
+
+func handleWebDAV(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("DAV", "1, 2")
+    w.Header().Set("MS-Author-Via", "DAV")
+    http.StripPrefix("/dav/", http.FileServer(http.Dir(uploadDir))).ServeHTTP(w, r)
+}
+
+func getMimeType(filepath string) string {
+    ext := path.Ext(filepath)
+    mimeType := mime.TypeByExtension(ext)
+    if mimeType == "" {
+        mimeType = "application/octet-stream"
+    }
+    return mimeType
+}
+
+func isImage(filename string) bool {
+    ext := strings.ToLower(path.Ext(filename))
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif"
+}
+
+func formatFileSize(size int64) string {
+    const unit = 1024
+    if size < unit {
+        return fmt.Sprintf("%d B", size)
+    }
+    div, exp := int64(unit), 0
+    for n := size / unit; n >= unit; n /= unit {
+        div *= unit
+        exp++
+    }
+    return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
 }
 
 func getLocalIP() string {
@@ -117,5 +207,5 @@ func getLocalIP() string {
             }
         }
     }
-    return "localhost"
+    return "127.0.0.1"
 }
