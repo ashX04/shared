@@ -1,0 +1,18 @@
+# Upload directory
+uploads/
+uploads/*
+
+# Binary
+fileserver
+fileserver.exe
+
+# Log files
+*.log
+
+# IDE directories
+.vscode/
+.idea/
+
+# Go specific
+*.test
+*.out
