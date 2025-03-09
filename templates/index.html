@@ -143,7 +143,7 @@
         .list-header > div {
             padding: 12px 16px;
             display: table-cell;
-            border-bottom: 2px solid var(--border-color);
+            border-bottom: 2px solid var (--border-color);
             text-align: left;
         }
 
@@ -706,22 +706,31 @@
 
             async function uploadLargeFile(file, statusText, progressBar) {
                 const uploadId = Math.random().toString(36).substring(7);
-                const chunkSize = 8 * 1024 * 1024; // 8MB chunks
+                const chunkSize = 16 * 1024 * 1024; // 16MB chunks
                 const totalChunks = Math.ceil(file.size / chunkSize);
                 const currentPath = new URLSearchParams(window.location.search).get('path') || '.';
-                const maxConcurrent = 9; // Increased from 3 to 6 concurrent uploads
+                const maxConcurrent = 15;    // Increased concurrent uploads
                 const maxRetries = 3;
                 const uploadedChunks = new Set();
+                const failedChunks = new Set();
                 
                 console.log(`Starting upload of ${file.name} (${formatSize(file.size)}) in ${totalChunks} chunks`);
                 
-                // Create array of chunk indices
+                // Create array of chunk indices and shuffle them for better distribution
                 const chunks = Array.from({length: totalChunks}, (_, i) => i);
+                chunks.sort(() => Math.random() - 0.5); // Shuffle chunks
+                
+                // Create a queue for failed chunks
+                const retryQueue = [];
                 
                 // Process chunks with increased concurrency
                 async function processChunks() {
-                    while (chunks.length > 0) {
-                        const batch = chunks.splice(0, maxConcurrent);
+                    while (chunks.length > 0 || retryQueue.length > 0) {
+                        const batch = [];
+                        while (batch.length < maxConcurrent && (chunks.length > 0 || retryQueue.length > 0)) {
+                            batch.push(retryQueue.shift() ?? chunks.shift());
+                        }
+                        
                         await Promise.all(batch.map(async chunkNumber => {
                             for (let attempt = 0; attempt < maxRetries; attempt++) {
                                 try {
@@ -742,20 +751,26 @@
                                         body: formData
                                     });
 
+                                    if (response.status === 429) {
+                                        // Too many requests, wait and retry
+                                        await new Promise(r => setTimeout(r, 1000));
+                                        throw new Error('Too many requests');
+                                    }
+
                                     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-                                    
-                                    const result = await response.json();
-                                    if (!result.success && result.error) throw new Error(result.error);
                                     
                                     uploadedChunks.add(chunkNumber);
                                     const progress = (uploadedChunks.size / totalChunks) * 100;
                                     progressBar.style.width = `${progress}%`;
                                     statusText.textContent = `Uploading ${file.name} (${uploadedChunks.size}/${totalChunks})`;
                                     
-                                    return true;
+                                    return;
                                 } catch (error) {
-                                    if (attempt === maxRetries - 1) throw error;
-                                    await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt))); // Exponential backoff
+                                    if (attempt === maxRetries - 1) {
+                                        failedChunks.add(chunkNumber);
+                                        retryQueue.push(chunkNumber);
+                                    }
+                                    await new Promise(r => setTimeout(r, 1000 * Math.pow(1.5, attempt))); // Exponential backoff
                                 }
                             }
                         }));

@@ -24,10 +24,11 @@ import (
 
 const (
     uploadDir = "./uploads"
-    maxWorkers = 10               // Number of concurrent upload workers
+    maxWorkers = 20               // Increased from 10 to 20
+    maxConcurrentUploads = 50     // New: Maximum concurrent upload handlers
     maxRetries = 3              // Maximum number of retry attempts
-    chunkSize = 8 * 1024 * 1024 // 8MB chunks
-    bufferSize = 32 * 1024      // 32KB buffer for file operations
+    chunkSize = 16 * 1024 * 1024  // Increased from 8MB to 16MB chunks
+    bufferSize = 256 * 1024       // Increased from 32KB to 256KB buffer
     tempDir = "./uploads/temp"   // Add temporary directory for chunks
     maxNetworkRetries = 3
     networkRetryDelay = 100 * time.Millisecond
@@ -113,6 +114,7 @@ var (
     uploadQueue chan UploadTask
     activeUploads = make(map[string]*ActiveUpload)
     activeUploadsMutex sync.RWMutex // Add mutex for map access
+    uploadSemaphore = make(chan struct{}, maxConcurrentUploads) // Add rate limiter for uploads
 )
 
 type ActiveUpload struct {
@@ -212,7 +214,7 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
     absUploadDir, _ := filepath.Abs(uploadDir)
     absFullPath, _ := filepath.Abs(fullPath)
     
-    if !strings.HasPrefix(absFullPath, absUploadDir) {
+    if (!strings.HasPrefix(absFullPath, absUploadDir)) {
         http.Redirect(w, r, "/", http.StatusFound)
         return
     }
@@ -648,6 +650,15 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 
 // Modify handleChunkUpload for better performance
 func handleChunkUpload(w http.ResponseWriter, r *http.Request) {
+    select {
+    case uploadSemaphore <- struct{}{}:
+        defer func() { <-uploadSemaphore }()
+    default:
+        // If we can't get a slot, return 429 Too Many Requests
+        w.WriteHeader(http.StatusTooManyRequests)
+        return
+    }
+
     if r.Method != http.MethodPost {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
         return
