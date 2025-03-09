@@ -19,13 +19,18 @@ import (
     "encoding/json"
     //"encoding/base64"
     "strconv"
+    "sync"
 )
 
 const (
     uploadDir = "./uploads"
-    maxWorkers = 10
-    chunkSize = 1024 * 1024 * 32 // 32MB chunks
+    maxWorkers = 10               // Number of concurrent upload workers
+    maxRetries = 3              // Maximum number of retry attempts
+    chunkSize = 8 * 1024 * 1024 // 8MB chunks
+    bufferSize = 32 * 1024      // 32KB buffer for file operations
     tempDir = "./uploads/temp"   // Add temporary directory for chunks
+    maxNetworkRetries = 3
+    networkRetryDelay = 100 * time.Millisecond
 )
 
 type FileInfo struct {
@@ -77,8 +82,38 @@ type ChunkInfo struct {
     CurrentPath string `json:"currentPath"` // Add current path
 }
 
-var uploadQueue chan UploadTask
-var activeUploads = make(map[string]*ActiveUpload)
+type UploadWorkerPool struct {
+    workers chan struct{}
+    wg      sync.WaitGroup
+}
+
+func NewUploadWorkerPool(maxWorkers int) *UploadWorkerPool {
+    return &UploadWorkerPool{
+        workers: make(chan struct{}, maxWorkers),
+    }
+}
+
+func (p *UploadWorkerPool) Submit(task func()) {
+    p.workers <- struct{}{} // Acquire worker
+    p.wg.Add(1)
+    go func() {
+        defer func() {
+            <-p.workers // Release worker
+            p.wg.Done()
+        }()
+        task()
+    }()
+}
+
+func (p *UploadWorkerPool) Wait() {
+    p.wg.Wait()
+}
+
+var (
+    uploadQueue chan UploadTask
+    activeUploads = make(map[string]*ActiveUpload)
+    activeUploadsMutex sync.RWMutex // Add mutex for map access
+)
 
 type ActiveUpload struct {
     TargetPath  string
@@ -110,6 +145,14 @@ func init() {
 
     // Create temp directory for uploads
     os.MkdirAll(tempDir, 0755)
+
+    // Add cleanup routine
+    go func() {
+        for {
+            time.Sleep(1 * time.Hour)
+            cleanupTempFiles()
+        }
+    }()
 }
 
 func main() {
@@ -290,82 +333,98 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
     }
 }
 
+// Modify handleUpload to use worker pool
 func handleUpload(w http.ResponseWriter, r *http.Request) {
     if r.Method != http.MethodPost {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
         return
     }
 
-    currentPath := r.FormValue("path")
+    currentPath := filepath.Clean(r.FormValue("path"))
     if currentPath == "" {
         currentPath = "."
     }
 
-    // Clean and validate path
-    currentPath = filepath.Clean(currentPath)
-    currentPath = strings.TrimPrefix(currentPath, "/")
     targetDir := filepath.Join(uploadDir, currentPath)
-    
-    // Ensure target directory exists
     if err := os.MkdirAll(targetDir, 0755); err != nil {
-        log.Printf("Error creating upload directory: %v", err)
-        http.Error(w, "Upload failed", http.StatusInternalServerError)
-        return
-    }
-
-    absUploadDir, _ := filepath.Abs(uploadDir)
-    absTargetDir, _ := filepath.Abs(targetDir)
-    if !strings.HasPrefix(absTargetDir, absUploadDir) {
-        http.Error(w, "Invalid path", http.StatusBadRequest)
+        http.Error(w, "Failed to create directory", http.StatusInternalServerError)
         return
     }
 
     r.ParseMultipartForm(32 << 20)
     files := r.MultipartForm.File["files"]
     
-    results := make([]uploadResult, 0, len(files))
-    resultChan := make(chan error, 1)
-
-    for _, fileHeader := range files {
-        task := UploadTask{
-            File:      fileHeader,
-            TargetDir: targetDir,
-            Result:    resultChan,
-        }
-        
-        // Send task to upload queue
-        uploadQueue <- task
-        
-        // Wait for result
-        err := <-resultChan
-        result := uploadResult{
-            Filename: fileHeader.Filename,
-            Success:  err == nil,
-        }
-        if err != nil {
-            result.Error = err.Error()
-            log.Printf("Error uploading %s: %v", fileHeader.Filename, err)
-        }
-        results = append(results, result)
+    pool := NewUploadWorkerPool(maxWorkers)
+    results := make([]uploadResult, len(files))
+    
+    for i, fileHeader := range files {
+        i, fileHeader := i, fileHeader // Create new variables for goroutine
+        pool.Submit(func() {
+            result := processUpload(fileHeader, targetDir)
+            results[i] = result
+        })
     }
 
-    // Return JSON response with upload results
+    pool.Wait() // Wait for all uploads to complete
+
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(map[string]interface{}{
-        "total":   len(files),
-        "success": len(files) - countErrors(results),
+        "success": true,
         "results": results,
     })
 }
 
-func countErrors(results []uploadResult) int {
-    count := 0
-    for _, r := range results {
-        if !r.Success {
-            count++
+func processUpload(fileHeader *multipart.FileHeader, targetDir string) uploadResult {
+    result := uploadResult{Filename: fileHeader.Filename}
+    
+    // Try upload with retries
+    var err error
+    for attempt := 0; attempt < maxRetries; attempt++ {
+        if err = uploadFile(fileHeader, targetDir); err == nil {
+            result.Success = true
+            return result
         }
+        time.Sleep(time.Duration(attempt*100) * time.Millisecond)
     }
-    return count
+    
+    result.Success = false
+    result.Error = err.Error()
+    return result
+}
+
+func uploadFile(fileHeader *multipart.FileHeader, targetDir string) error {
+    return withRetry(func() error {
+        src, err := fileHeader.Open()
+        if err != nil {
+            return fmt.Errorf("failed to open source: %v", err)
+        }
+        defer src.Close()
+
+        dst, err := os.OpenFile(
+            filepath.Join(targetDir, fileHeader.Filename),
+            os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
+            0644,
+        )
+        if err != nil {
+            return fmt.Errorf("failed to create destination: %v", err)
+        }
+        defer dst.Close()
+
+        // Use buffered copy for better performance
+        buf := make([]byte, bufferSize)
+        written, err := io.CopyBuffer(dst, src, buf)
+        if err != nil {
+            return fmt.Errorf("failed to copy: %v", err)
+        }
+
+        // Ensure data is written to disk
+        if err := dst.Sync(); err != nil {
+            return fmt.Errorf("failed to sync: %v", err)
+        }
+
+        logOperation("UPLOAD", filepath.Join(targetDir, fileHeader.Filename), written)
+        return nil
+    })
 }
 
 func uploadWorker() {
@@ -395,6 +454,7 @@ func uploadWorker() {
     }
 }
 
+// Modify handleFileServing to include retries
 func handleFileServing(w http.ResponseWriter, r *http.Request) {
     // Clean the requested path
     requestPath := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/files/"))
@@ -419,7 +479,27 @@ func handleFileServing(w http.ResponseWriter, r *http.Request) {
         logOperation("DOWNLOAD", requestPath, info.Size())
     }
 
-    http.ServeFile(w, r, filePath)
+    err := withRetry(func() error {
+        f, err := os.Open(filePath)
+        if err != nil {
+            return err
+        }
+        defer f.Close()
+
+        info, err := f.Stat()
+        if err != nil {
+            return err
+        }
+
+        http.ServeContent(w, r, filepath.Base(filePath), info.ModTime(), f)
+        return nil
+    })
+
+    if err != nil {
+        log.Printf("Error serving file: %v", err)
+        http.Error(w, "Failed to serve file", http.StatusInternalServerError)
+        return
+    }
 }
 
 func handleQR(w http.ResponseWriter, r *http.Request) {
@@ -566,6 +646,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
     w.WriteHeader(http.StatusOK)
 }
 
+// Modify handleChunkUpload for better performance
 func handleChunkUpload(w http.ResponseWriter, r *http.Request) {
     if r.Method != http.MethodPost {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -611,76 +692,104 @@ func handleChunkUpload(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    // Use RLock for reading
+    activeUploadsMutex.RLock()
     upload, exists := activeUploads[uploadID]
-    if (!exists) {
-        // Create temp file with proper permissions
-        tempFile, err := os.OpenFile(
-            filepath.Join(tempDir, fmt.Sprintf("%s-%s", uploadID, fileName)),
-            os.O_CREATE|os.O_RDWR,
-            0644,
-        )
-        if err != nil {
-            log.Printf("Error creating temp file: %v", err)
-            http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
-            return
-        }
+    activeUploadsMutex.RUnlock()
 
-        upload = &ActiveUpload{
-            TargetPath:  targetPath,
-            TotalChunks: totalChunks,
-            Received:    make(map[int]bool),
-            TempFile:    tempFile,
+    if !exists {
+        // Switch to write lock for modification
+        activeUploadsMutex.Lock()
+        // Check again in case another goroutine created it
+        upload, exists = activeUploads[uploadID]
+        if !exists {
+            tempFile, err := os.OpenFile(
+                filepath.Join(tempDir, fmt.Sprintf("%s-%s", uploadID, fileName)),
+                os.O_CREATE|os.O_RDWR|os.O_SYNC,
+                0644,
+            )
+            if err != nil {
+                activeUploadsMutex.Unlock()
+                log.Printf("Error creating temp file: %v", err)
+                http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
+                return
+            }
+
+            if totalChunks > 0 {
+                tempFile.Truncate(int64(totalChunks * chunkSize))
+            }
+
+            upload = &ActiveUpload{
+                TargetPath:  targetPath,
+                TotalChunks: totalChunks,
+                Received:    make(map[int]bool),
+                TempFile:    tempFile,
+            }
+            activeUploads[uploadID] = upload
         }
-        activeUploads[uploadID] = upload
-        log.Printf("Created new upload for %s", fileName)
+        activeUploadsMutex.Unlock()
     }
 
-    // Get chunk data
+    // Get chunk data with buffered read
     chunk, _, err := r.FormFile("chunk")
     if err != nil {
-        log.Printf("Error getting chunk file: %v", err)
         http.Error(w, "No chunk data received", http.StatusBadRequest)
         return
     }
     defer chunk.Close()
 
-    // Write chunk data at correct offset
+    // Use buffered write
+    buffer := make([]byte, bufferSize)
     offset := int64(chunkNumber * chunkSize)
-    data, err := io.ReadAll(chunk)
-    if err != nil {
-        log.Printf("Error reading chunk data: %v", err)
-        http.Error(w, "Failed to read chunk", http.StatusInternalServerError)
-        return
+    
+    writer := &offsetWriter{
+        file:   upload.TempFile,
+        offset: offset,
+        buffer: buffer,
     }
+    
+    err = withRetry(func() error {
+        _, err := io.CopyBuffer(writer, chunk, buffer)
+        return err
+    })
 
-    if _, err := upload.TempFile.WriteAt(data, offset); err != nil {
+    if err != nil {
         log.Printf("Error writing chunk: %v", err)
         http.Error(w, "Failed to write chunk", http.StatusInternalServerError)
         return
     }
 
     upload.Received[chunkNumber] = true
-    log.Printf("Successfully wrote chunk %d/%d for %s", chunkNumber+1, totalChunks, fileName)
 
     // Check if upload is complete
     if len(upload.Received) == totalChunks {
+        upload.TempFile.Sync() // Ensure all data is written
         upload.TempFile.Close()
-        tempPath := upload.TempFile.Name()
         
-        log.Printf("Upload complete, moving %s to %s", tempPath, targetPath)
-        
-        if err := os.Rename(tempPath, targetPath); err != nil {
-            log.Printf("Error moving file: %v", err)
+        // Move file with retry
+        var moveErr error
+        for i := 0; i < maxRetries; i++ {
+            moveErr = os.Rename(upload.TempFile.Name(), targetPath)
+            if moveErr == nil {
+                break
+            }
+            time.Sleep(100 * time.Millisecond)
+        }
+
+        if moveErr != nil {
+            log.Printf("Error moving file after %d retries: %v", maxRetries, moveErr)
             http.Error(w, "Failed to finalize upload", http.StatusInternalServerError)
             return
         }
 
+        activeUploadsMutex.Lock()
         delete(activeUploads, uploadID)
+        activeUploadsMutex.Unlock()
         
         if info, err := os.Stat(targetPath); err == nil {
             logOperation("UPLOAD", fileName, info.Size())
         }
-        
+
         w.WriteHeader(http.StatusOK)
         json.NewEncoder(w).Encode(map[string]interface{}{
             "success": true,
@@ -694,6 +803,17 @@ func handleChunkUpload(w http.ResponseWriter, r *http.Request) {
         "chunksReceived": len(upload.Received),
         "totalChunks":   totalChunks,
     })
+}
+
+// Enhanced offsetWriter with buffering
+type offsetWriter struct {
+    file   *os.File
+    offset int64
+    buffer []byte
+}
+
+func (w *offsetWriter) Write(p []byte) (n int, err error) {
+    return w.file.WriteAt(p, w.offset)
 }
 
 func handleBatchDelete(w http.ResponseWriter, r *http.Request) {
@@ -776,4 +896,67 @@ func getLocalIP() string {
         }
     }
     return "127.0.0.1"
+}
+
+// Add retry utility function
+func withRetry(operation func() error) error {
+    var lastErr error
+    for attempt := 0; attempt < maxNetworkRetries; attempt++ {
+        if err := operation(); err == nil {
+            return nil
+        } else {
+            lastErr = err
+            // Only retry on network/IO errors
+            if !isRetryableError(err) {
+                return err
+            }
+            time.Sleep(networkRetryDelay * time.Duration(attempt+1))
+        }
+    }
+    return fmt.Errorf("failed after %d attempts: %v", maxNetworkRetries, lastErr)
+}
+
+func isRetryableError(err error) bool {
+    if err == nil {
+        return false
+    }
+    // Check for common network errors
+    if netErr, ok := err.(net.Error); ok {
+        return netErr.Temporary() || netErr.Timeout()
+    }
+    // Check for specific error strings
+    errStr := err.Error()
+    return strings.Contains(errStr, "connection reset") ||
+           strings.Contains(errStr, "broken pipe") ||
+           strings.Contains(errStr, "connection refused") ||
+           strings.Contains(errStr, "no such host") ||
+           strings.Contains(errStr, "timeout")
+}
+
+func cleanupTempFiles() {
+    activeUploadsMutex.RLock()
+    defer activeUploadsMutex.RUnlock()
+
+    files, err := os.ReadDir(tempDir)
+    if err != nil {
+        log.Printf("Error reading temp directory: %v", err)
+        return
+    }
+
+    for _, file := range files {
+        // Skip if file is part of active upload
+        isActive := false
+        for _, upload := range activeUploads {
+            if strings.Contains(file.Name(), filepath.Base(upload.TempFile.Name())) {
+                isActive = true
+                break
+            }
+        }
+
+        if !isActive {
+            if err := os.Remove(filepath.Join(tempDir, file.Name())); err != nil {
+                log.Printf("Error removing temp file %s: %v", file.Name(), err)
+            }
+        }
+    }
 }

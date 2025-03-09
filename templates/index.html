@@ -311,7 +311,7 @@
         }
 
         .file-item.selected {
-            background: var(--hover-color);
+            background: var (--hover-color);
             border-color: var(--primary-color);
         }
 
@@ -706,52 +706,83 @@
 
             async function uploadLargeFile(file, statusText, progressBar) {
                 const uploadId = Math.random().toString(36).substring(7);
-                const chunkSize = 2 * 1024 * 1024; // 2MB chunks
+                const chunkSize = 8 * 1024 * 1024; // 8MB chunks
                 const totalChunks = Math.ceil(file.size / chunkSize);
                 const currentPath = new URLSearchParams(window.location.search).get('path') || '.';
+                const maxConcurrent = 9; // Increased from 3 to 6 concurrent uploads
+                const maxRetries = 3;
+                const uploadedChunks = new Set();
                 
-                console.log(`Starting upload of ${file.name} (${file.size} bytes) in ${totalChunks} chunks`);
+                console.log(`Starting upload of ${file.name} (${formatSize(file.size)}) in ${totalChunks} chunks`);
                 
-                for (let chunkNumber = 0; chunkNumber < totalChunks; chunkNumber++) {
-                    const start = chunkNumber * chunkSize;
-                    const end = Math.min(start + chunkSize, file.size);
-                    const chunk = file.slice(start, end);
-                    
-                    const formData = new FormData();
-                    formData.append('uploadId', uploadId);
-                    formData.append('chunkNumber', chunkNumber.toString());
-                    formData.append('totalChunks', totalChunks.toString());
-                    formData.append('fileName', file.name);
-                    formData.append('currentPath', currentPath);
-                    formData.append('chunk', chunk);
+                // Create array of chunk indices
+                const chunks = Array.from({length: totalChunks}, (_, i) => i);
+                
+                // Process chunks with increased concurrency
+                async function processChunks() {
+                    while (chunks.length > 0) {
+                        const batch = chunks.splice(0, maxConcurrent);
+                        await Promise.all(batch.map(async chunkNumber => {
+                            for (let attempt = 0; attempt < maxRetries; attempt++) {
+                                try {
+                                    const start = chunkNumber * chunkSize;
+                                    const end = Math.min(start + chunkSize, file.size);
+                                    const chunk = file.slice(start, end);
+                                    
+                                    const formData = new FormData();
+                                    formData.append('uploadId', uploadId);
+                                    formData.append('chunkNumber', chunkNumber.toString());
+                                    formData.append('totalChunks', totalChunks.toString());
+                                    formData.append('fileName', file.name);
+                                    formData.append('currentPath', currentPath);
+                                    formData.append('chunk', chunk);
 
-                    try {
-                        console.log(`Uploading chunk ${chunkNumber + 1}/${totalChunks}`);
-                        const response = await fetch('/chunk-upload', {
-                            method: 'POST',
-                            body: formData
-                        });
+                                    const response = await fetch('/chunk-upload', {
+                                        method: 'POST',
+                                        body: formData
+                                    });
 
-                        if (!response.ok) {
-                            throw new Error(`HTTP error! status: ${response.status}`);
-                        }
-
-                        const result = await response.json();
-                        if (result.success) {
-                            console.log(`Upload complete: ${file.name}`);
-                            progressBar.style.width = '100%';
-                            statusText.textContent = `Uploaded ${file.name}`;
-                            return;
-                        }
-
-                        const progress = ((chunkNumber + 1) / totalChunks) * 100;
-                        progressBar.style.width = `${progress}%`;
-                        statusText.textContent = `Uploading ${file.name} (${chunkNumber + 1}/${totalChunks})`;
-                    } catch (error) {
-                        console.error(`Error uploading chunk ${chunkNumber + 1}:`, error);
-                        throw new Error(`Failed to upload ${file.name}: ${error.message}`);
+                                    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                                    
+                                    const result = await response.json();
+                                    if (!result.success && result.error) throw new Error(result.error);
+                                    
+                                    uploadedChunks.add(chunkNumber);
+                                    const progress = (uploadedChunks.size / totalChunks) * 100;
+                                    progressBar.style.width = `${progress}%`;
+                                    statusText.textContent = `Uploading ${file.name} (${uploadedChunks.size}/${totalChunks})`;
+                                    
+                                    return true;
+                                } catch (error) {
+                                    if (attempt === maxRetries - 1) throw error;
+                                    await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt))); // Exponential backoff
+                                }
+                            }
+                        }));
                     }
                 }
+
+                try {
+                    await processChunks();
+                    console.log(`Upload complete: ${file.name}`);
+                    progressBar.style.width = '100%';
+                    statusText.textContent = `Uploaded ${file.name}`;
+                    return true;
+                } catch (error) {
+                    console.error(`Error uploading ${file.name}:`, error);
+                    throw error;
+                }
+            }
+
+            function formatSize(bytes) {
+                const units = ['B', 'KB', 'MB', 'GB'];
+                let size = bytes;
+                let unitIndex = 0;
+                while (size >= 1024 && unitIndex < units.length - 1) {
+                    size /= 1024;
+                    unitIndex++;
+                }
+                return `${size.toFixed(1)} ${units[unitIndex]}`;
             }
 
             // Add selection handling
