@@ -340,11 +340,46 @@ func handleMove(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    src := filepath.Join(uploadDir, r.FormValue("src"))
-    dst := filepath.Join(uploadDir, r.FormValue("dst"))
+    src := filepath.Clean(filepath.Join(uploadDir, r.FormValue("src")))
+    dst := filepath.Clean(filepath.Join(uploadDir, r.FormValue("dst")))
+
+    // Handle moves to root directory
+    if r.FormValue("dst") == "." {
+        dst = filepath.Join(uploadDir, filepath.Base(src))
+    }
     
-    if !strings.HasPrefix(src, uploadDir) || !strings.HasPrefix(dst, uploadDir) {
+    // Clean and validate paths
+    absUploadDir, _ := filepath.Abs(uploadDir)
+    absSrc, _ := filepath.Abs(src)
+    absDst, _ := filepath.Abs(dst)
+    
+    if !strings.HasPrefix(absSrc, absUploadDir) || !strings.HasPrefix(absDst, absUploadDir) {
         http.Error(w, "Invalid path", http.StatusBadRequest)
+        return
+    }
+
+    // Check if source exists and is not a directory
+    srcInfo, err := os.Stat(src)
+    if err != nil {
+        log.Printf("Source file not found: %v", err)
+        http.Error(w, "Source file not found", http.StatusNotFound)
+        return
+    }
+    if srcInfo.IsDir() {
+        http.Error(w, "Cannot move directories", http.StatusBadRequest)
+        return
+    }
+
+    // If destination is a directory, put the file inside it
+    dstInfo, err := os.Stat(dst)
+    if err == nil && dstInfo.IsDir() {
+        dst = filepath.Join(dst, filepath.Base(src))
+    }
+
+    // Create parent directories if needed
+    if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+        log.Printf("Error creating destination directory: %v", err)
+        http.Error(w, "Error creating directory", http.StatusInternalServerError)
         return
     }
 

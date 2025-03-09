@@ -198,7 +198,7 @@
             <button class="view-toggle" data-view="list">
                 <i class="fas fa-list"></i> List
             </button>
-            <button onclick="createFolder()" class="view-toggle">
+            <button class="view-toggle" onclick="window.createFolder()">
                 <i class="fas fa-folder-plus"></i> New Folder
             </button>
         </div>
@@ -295,6 +295,22 @@
     </div>
 
     <script>
+        // Make createFolder globally accessible
+        window.createFolder = function() {
+            const name = prompt('Enter folder name:');
+            if (name) {
+                const currentPath = new URLSearchParams(window.location.search).get('path') || '';
+                const form = new FormData();
+                form.append('name', name);
+                form.append('path', currentPath);
+                
+                fetch('/folder', {
+                    method: 'POST',
+                    body: form
+                }).then(() => window.location.reload());
+            }
+        };
+
         document.addEventListener('DOMContentLoaded', function() {
             const gridView = document.querySelector('.files-grid');
             const listView = document.querySelector('.files-list');
@@ -317,24 +333,34 @@
                 });
             });
 
-            // Context menu
+            // Context menu with move to home option
             let contextMenu = null;
             document.addEventListener('contextmenu', (e) => {
                 const fileItem = e.target.closest('.file-item');
-                if (fileItem) {
+                if (fileItem && !fileItem.querySelector('.fa-level-up-alt')) {
                     e.preventDefault();
                     if (contextMenu) contextMenu.remove();
                     
                     const fileName = fileItem.dataset.path;
+                    const isDir = fileItem.dataset.isDir === 'true';
                     contextMenu = document.createElement('div');
                     contextMenu.className = 'context-menu';
                     contextMenu.innerHTML = `
+                        ${!isDir ? `
                         <div class="context-menu-item" onclick="window.location='/files/${fileName}?download=true'">
                             <i class="fas fa-download"></i> Download
                         </div>
                         <div class="context-menu-item" onclick="window.open('/files/${fileName}')">
                             <i class="fas fa-external-link-alt"></i> Open
                         </div>
+                        <div class="context-menu-item" onclick="moveToHome('${fileName}')">
+                            <i class="fas fa-home"></i> Move to Home
+                        </div>
+                        ` : `
+                        <div class="context-menu-item" onclick="window.location='/?path=${fileName}'">
+                            <i class="fas fa-folder-open"></i> Open
+                        </div>
+                        `}
                     `;
                     
                     contextMenu.style.left = e.pageX + 'px';
@@ -343,10 +369,18 @@
                 }
             });
 
-            // Click outside to close context menu
-            document.addEventListener('click', () => {
-                if (contextMenu) contextMenu.remove();
-            });
+            // Utility functions
+            const path = {
+                join: function() {
+                    return Array.from(arguments)
+                        .map(part => part.replace(/^\/+|\/+$/g, ''))
+                        .filter(part => part.length)
+                        .join('/');
+                },
+                basename: function(path) {
+                    return path.split('/').pop();
+                }
+            };
 
             // Drag and drop
             const dropZone = document.getElementById('dropZone');
@@ -357,6 +391,7 @@
             
             dropZone.addEventListener('dragover', (e) => {
                 e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
                 dropZone.classList.add('drag-over');
             });
 
@@ -368,49 +403,45 @@
                 e.preventDefault();
                 dropZone.classList.remove('drag-over');
                 
-                const files = e.dataTransfer.files;
-                const formData = new FormData();
-                const currentPath = new URLSearchParams(window.location.search).get('path') || '';
-                
-                formData.append('path', currentPath);
-                for (let file of files) {
-                    formData.append('files', file);
+                // Check if this is an internal drag (file move)
+                const srcPath = e.dataTransfer.getData('text/plain');
+                if (srcPath) {
+                    // This is a move operation
+                    moveToHome(srcPath);
+                } else {
+                    // This is a file upload
+                    const files = e.dataTransfer.files;
+                    const formData = new FormData(uploadForm);
+                    for (let file of files) {
+                        formData.append('files', file);
+                    }
+                    
+                    fetch('/upload', {
+                        method: 'POST',
+                        body: formData
+                    }).then(() => window.location.reload());
                 }
-
-                fetch('/upload', {
-                    method: 'POST',
-                    body: formData
-                }).then(() => window.location.reload());
             });
 
             fileInput.addEventListener('change', () => {
                 uploadForm.submit();
             });
 
-            function createFolder() {
-                const name = prompt('Enter folder name:');
-                if (name) {
-                    const currentPath = new URLSearchParams(window.location.search).get('path') || '';
-                    const form = new FormData();
-                    form.append('name', name);
-                    form.append('path', currentPath);
-                    
-                    fetch('/folder', {
-                        method: 'POST',
-                        body: form
-                    }).then(() => window.location.reload());
-                }
-            }
-
-            // Add drag and drop for files/folders
+            // Update drag and drop for files/folders
             document.querySelectorAll('.file-item').forEach(item => {
                 item.addEventListener('dragstart', e => {
                     e.dataTransfer.setData('text/plain', item.dataset.path);
+                    e.dataTransfer.setData('is-dir', item.dataset.isDir);
+                    item.classList.add('dragging');
+                });
+
+                item.addEventListener('dragend', e => {
+                    item.classList.remove('dragging');
                 });
 
                 item.addEventListener('dragover', e => {
+                    e.preventDefault();
                     if (item.dataset.isDir === 'true') {
-                        e.preventDefault();
                         item.classList.add('drag-over');
                     }
                 });
@@ -424,20 +455,43 @@
                     item.classList.remove('drag-over');
                     
                     const srcPath = e.dataTransfer.getData('text/plain');
+                    const isSourceDir = e.dataTransfer.getData('is-dir') === 'true';
                     const dstPath = item.dataset.path;
                     
-                    if (srcPath && dstPath) {
+                    if (srcPath && dstPath && !isSourceDir) {
                         const form = new FormData();
                         form.append('src', srcPath);
-                        form.append('dst', path.join(dstPath, path.basename(srcPath)));
+                        form.append('dst', dstPath);
                         
                         fetch('/move', {
                             method: 'POST',
                             body: form
-                        }).then(() => window.location.reload());
+                        }).then(response => {
+                            if (response.ok) {
+                                window.location.reload();
+                            } else {
+                                alert('Error moving file');
+                            }
+                        });
                     }
                 });
             });
+
+            // Add visual feedback styles
+            const style = document.createElement('style');
+            style.textContent = `
+                .dragging {
+                    opacity: 0.5;
+                }
+                .drag-over {
+                    background: var(--hover-color) !important;
+                    border: 2px dashed var(--primary-color) !important;
+                }
+                .file-item {
+                    user-select: none;
+                }
+            `;
+            document.head.appendChild(style);
 
             // Add active state to grid view by default
             document.querySelector('[data-view="grid"]').classList.add('active');
@@ -451,6 +505,24 @@
                     location.reload();
                 });
             });
+
+            // Move to home function
+            window.moveToHome = function(srcPath) {
+                const form = new FormData();
+                form.append('src', srcPath);
+                form.append('dst', '.');
+                
+                fetch('/move', {
+                    method: 'POST',
+                    body: form
+                }).then(response => {
+                    if (response.ok) {
+                        window.location.reload();
+                    } else {
+                        alert('Error moving file');
+                    }
+                });
+            };
         });
     </script>
 </body>
