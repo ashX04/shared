@@ -131,23 +131,76 @@
             border: 1px solid var(--border-color);
             border-radius: 8px;
             overflow: hidden;
+            width: calc(100% - 30px);
         }
 
         .list-header {
             background: var(--bg-gray);
             font-weight: 600;
+            display: table-row;
         }
 
         .list-header > div {
-            padding: 12px;
+            padding: 12px 16px;
+            display: table-cell;
+            border-bottom: 2px solid var(--border-color);
+            text-align: left;
+        }
+
+        .file-item.list-view {
+            display: table-row;
         }
 
         .file-item.list-view > div {
-            padding: 12px;
+            display: table-cell;
+            padding: 10px 16px;
+            vertical-align: middle;
+            border-bottom: 1px solid var(--border-color);
+            text-align: left;
+            white-space: nowrap;
+        }
+
+        .file-item.list-view > div:first-child {
+            width: 50%;
+        }
+
+        .file-item.list-view > div:not(:first-child) {
+            width: 16.66%;
+            color: #666;
+        }
+
+        .file-item.list-view i {
+            margin-right: 8px;
+            width: 16px;
+            text-align: center;
+        }
+
+        .file-item.list-view a {
+            text-decoration: none;
+            color: var(--primary-color);
         }
 
         .file-item.list-view:hover {
             background: var(--hover-color);
+        }
+
+        /* Adjust table cell widths */
+        .list-header > div:first-child,
+        .file-item.list-view > div:first-child {
+            width: 40%;
+        }
+
+        .list-header > div:not(:first-child),
+        .file-item.list-view > div:not(:first-child) {
+            width: 20%;
+        }
+
+        /* Add ellipsis for long filenames */
+        .file-item.list-view > div:first-child {
+            max-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         .context-menu {
@@ -316,9 +369,25 @@
             const listView = document.querySelector('.files-list');
             const viewToggles = document.querySelectorAll('.view-toggle');
 
-            // View toggle
+            // Get saved view preference
+            const savedView = localStorage.getItem('viewPreference') || 'grid';
+            
+            // Apply saved view
+            if (savedView === 'list') {
+                gridView.style.display = 'none';
+                listView.style.display = 'table';
+                document.querySelector('[data-view="list"]').classList.add('active');
+            } else {
+                gridView.style.display = 'grid';
+                listView.style.display = 'none';
+                document.querySelector('[data-view="grid"]').classList.add('active');
+            }
+
+            // View toggle with persistence
             viewToggles.forEach(toggle => {
                 toggle.addEventListener('click', () => {
+                    if (!toggle.dataset.view) return; // Skip if not a view toggle
+                    
                     const view = toggle.dataset.view;
                     viewToggles.forEach(t => t.classList.remove('active'));
                     toggle.classList.add('active');
@@ -330,6 +399,9 @@
                         gridView.style.display = 'none';
                         listView.style.display = 'table';
                     }
+                    
+                    // Save preference
+                    localStorage.setItem('viewPreference', view);
                 });
             });
 
