@@ -15,9 +15,18 @@ import (
     "github.com/skip2/go-qrcode"
     "path"
     "net/url"
+    "mime/multipart"
+    "encoding/json"
+    //"encoding/base64"
+    "strconv"
 )
 
-const uploadDir = "./uploads"
+const (
+    uploadDir = "./uploads"
+    maxWorkers = 10
+    chunkSize = 1024 * 1024 * 32 // 32MB chunks
+    tempDir = "./uploads/temp"   // Add temporary directory for chunks
+)
 
 type FileInfo struct {
     Name      string
@@ -35,11 +44,47 @@ type ViewData struct {
     Path       string
     Breadcrumb []BreadcrumbItem
     Parent     string
+    Stats      struct {
+        TotalFiles    int
+        TotalFolders  int
+        TotalSize     int64
+    }
 }
 
 type BreadcrumbItem struct {
     Name string
     Path string
+}
+
+type UploadTask struct {
+    File     *multipart.FileHeader
+    TargetDir string
+    Result   chan error
+}
+
+type uploadResult struct {
+    Filename string `json:"filename"`
+    Success  bool   `json:"success"`
+    Error    string `json:"error,omitempty"`
+}
+
+type ChunkInfo struct {
+    UploadID    string `json:"uploadId"`
+    ChunkNumber int    `json:"chunkNumber"`
+    TotalChunks int    `json:"totalChunks"`
+    FileName    string `json:"fileName"`
+    Chunk       string `json:"chunk"`  // Base64 encoded chunk data
+    CurrentPath string `json:"currentPath"` // Add current path
+}
+
+var uploadQueue chan UploadTask
+var activeUploads = make(map[string]*ActiveUpload)
+
+type ActiveUpload struct {
+    TargetPath  string
+    TotalChunks int
+    Received    map[int]bool
+    TempFile    *os.File
 }
 
 func init() {
@@ -56,6 +101,15 @@ func init() {
     mime.AddExtensionType(".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     mime.AddExtensionType(".xls", "application/vnd.ms-excel")
     mime.AddExtensionType(".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    uploadQueue = make(chan UploadTask, 100) // Buffer for up to 100 pending uploads
+    // Start upload workers
+    for i := 0; i < maxWorkers; i++ {
+        go uploadWorker()
+    }
+
+    // Create temp directory for uploads
+    os.MkdirAll(tempDir, 0755)
 }
 
 func main() {
@@ -69,6 +123,9 @@ func main() {
     http.Handle("/dav/", logRequest(handleWebDAV))
     http.HandleFunc("/folder", handleCreateFolder)
     http.HandleFunc("/move", handleMove)
+    http.HandleFunc("/delete", handleDelete)
+    http.HandleFunc("/chunk-upload", handleChunkUpload)
+    http.HandleFunc("/batch-delete", handleBatchDelete)
     
     ip := getLocalIP()
     port := ":8080"
@@ -83,6 +140,14 @@ func logRequest(next http.HandlerFunc) http.HandlerFunc {
         next.ServeHTTP(w, r)
         log.Printf("Completed %s %s in %v", r.Method, r.URL.Path, time.Since(start))
     }
+}
+
+func logOperation(operation, filename string, size int64) {
+    fmt.Printf("[%s] %s: %s (%s)\n", 
+        time.Now().Format("2006-01-02 15:04:05"),
+        operation,
+        filename,
+        formatFileSize(size))
 }
 
 func handleHome(w http.ResponseWriter, r *http.Request) {
@@ -165,11 +230,28 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
         }
     }
 
+    // Calculate stats
+    stats := struct {
+        TotalFiles    int
+        TotalFolders  int
+        TotalSize     int64
+    }{}
+
+    for _, fi := range fileInfos {
+        if (fi.IsDir) {
+            stats.TotalFolders++
+        } else {
+            stats.TotalFiles++
+            stats.TotalSize += fi.Size
+        }
+    }
+
     viewData := ViewData{
         Files:      fileInfos,
         Path:       currentPath,
         Breadcrumb: breadcrumb,
         Parent:     filepath.Dir(currentPath),
+        Stats:      stats,
     }
 
     funcMap := template.FuncMap{
@@ -190,7 +272,7 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
                 return "fas fa-music"
             case strings.Contains(mimeType, "pdf"):
                 return "fas fa-file-pdf"
-            case strings.Contains(mimeType, "word"):
+            case strings.Contains(mimeType, "word"):  // Fixed contains to Contains
                 return "fas fa-file-word"
             case strings.Contains(mimeType, "excel"):
                 return "fas fa-file-excel"
@@ -240,25 +322,77 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
     r.ParseMultipartForm(32 << 20)
     files := r.MultipartForm.File["files"]
+    
+    results := make([]uploadResult, 0, len(files))
+    resultChan := make(chan error, 1)
 
     for _, fileHeader := range files {
-        file, err := fileHeader.Open()
-        if err != nil {
-            log.Printf("Error opening uploaded file: %v", err)
-            continue
+        task := UploadTask{
+            File:      fileHeader,
+            TargetDir: targetDir,
+            Result:    resultChan,
         }
-        defer file.Close()
-
-        dst, err := os.Create(filepath.Join(targetDir, fileHeader.Filename))
-        if err != nil {
-            log.Printf("Error creating file: %v", err)
-            continue
+        
+        // Send task to upload queue
+        uploadQueue <- task
+        
+        // Wait for result
+        err := <-resultChan
+        result := uploadResult{
+            Filename: fileHeader.Filename,
+            Success:  err == nil,
         }
-        defer dst.Close()
-        io.Copy(dst, file)
+        if err != nil {
+            result.Error = err.Error()
+            log.Printf("Error uploading %s: %v", fileHeader.Filename, err)
+        }
+        results = append(results, result)
     }
 
-    http.Redirect(w, r, "/?path="+url.QueryEscape(currentPath), http.StatusSeeOther)
+    // Return JSON response with upload results
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "total":   len(files),
+        "success": len(files) - countErrors(results),
+        "results": results,
+    })
+}
+
+func countErrors(results []uploadResult) int {
+    count := 0
+    for _, r := range results {
+        if !r.Success {
+            count++
+        }
+    }
+    return count
+}
+
+func uploadWorker() {
+    for task := range uploadQueue {
+        file, err := task.File.Open()
+        if err != nil {
+            task.Result <- err
+            continue
+        }
+
+        dst, err := os.Create(filepath.Join(task.TargetDir, task.File.Filename))
+        if err != nil {
+            file.Close()
+            task.Result <- err
+            continue
+        }
+
+        written, err := io.Copy(dst, file)
+        file.Close()
+        dst.Close()
+        
+        if err == nil {
+            logOperation("UPLOAD", filepath.Join(task.TargetDir, task.File.Filename), written)
+        }
+        
+        task.Result <- err
+    }
 }
 
 func handleFileServing(w http.ResponseWriter, r *http.Request) {
@@ -277,6 +411,12 @@ func handleFileServing(w http.ResponseWriter, r *http.Request) {
     // Set content disposition for download
     if r.URL.Query().Get("download") == "true" {
         w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(filePath)))
+    }
+
+    // Log download
+    info, _ := os.Stat(filePath)
+    if info != nil {
+        logOperation("DOWNLOAD", requestPath, info.Size())
     }
 
     http.ServeFile(w, r, filePath)
@@ -390,6 +530,213 @@ func handleMove(w http.ResponseWriter, r *http.Request) {
     }
 
     w.WriteHeader(http.StatusOK)
+}
+
+func handleDelete(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    path := filepath.Clean(r.FormValue("path"))
+    fullPath := filepath.Join(uploadDir, path)
+
+    // Validate path
+    absUploadDir, _ := filepath.Abs(uploadDir)
+    absPath, _ := filepath.Abs(fullPath)
+    if !strings.HasPrefix(absPath, absUploadDir) {
+        http.Error(w, "Invalid path", http.StatusBadRequest)
+        return
+    }
+
+    info, err := os.Stat(fullPath)
+    if err != nil {
+        http.Error(w, "File not found", http.StatusNotFound)
+        return
+    }
+
+    err = os.RemoveAll(fullPath)
+    if err != nil {
+        log.Printf("Error deleting: %v", err)
+        http.Error(w, "Error deleting item", http.StatusInternalServerError)
+        return
+    }
+
+    logOperation("DELETE", path, info.Size())
+    w.WriteHeader(http.StatusOK)
+}
+
+func handleChunkUpload(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    // Parse the multipart form data with larger buffer
+    if err := r.ParseMultipartForm(64 << 20); err != nil {
+        log.Printf("Error parsing form: %v", err)
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+
+    // Get chunk info from form
+    uploadID := r.FormValue("uploadId")
+    fileName := r.FormValue("fileName")
+    currentPath := r.FormValue("currentPath")
+    chunkNumber, _ := strconv.Atoi(r.FormValue("chunkNumber"))
+    totalChunks, _ := strconv.Atoi(r.FormValue("totalChunks"))
+
+    log.Printf("Receiving chunk %d/%d for %s", chunkNumber+1, totalChunks, fileName)
+
+    if currentPath == "" {
+        currentPath = "."
+    }
+
+    // Create target directory
+    targetDir := filepath.Join(uploadDir, currentPath)
+    if err := os.MkdirAll(targetDir, 0755); err != nil {
+        log.Printf("Error creating directory %s: %v", targetDir, err)
+        http.Error(w, "Failed to create directory", http.StatusInternalServerError)
+        return
+    }
+
+    targetPath := filepath.Join(targetDir, fileName)
+    
+    // Validate target path
+    absUploadDir, _ := filepath.Abs(uploadDir)
+    absTargetPath, _ := filepath.Abs(targetPath)
+    if !strings.HasPrefix(absTargetPath, absUploadDir) {
+        log.Printf("Invalid target path: %s", targetPath)
+        http.Error(w, "Invalid path", http.StatusBadRequest)
+        return
+    }
+
+    upload, exists := activeUploads[uploadID]
+    if (!exists) {
+        // Create temp file with proper permissions
+        tempFile, err := os.OpenFile(
+            filepath.Join(tempDir, fmt.Sprintf("%s-%s", uploadID, fileName)),
+            os.O_CREATE|os.O_RDWR,
+            0644,
+        )
+        if err != nil {
+            log.Printf("Error creating temp file: %v", err)
+            http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
+            return
+        }
+
+        upload = &ActiveUpload{
+            TargetPath:  targetPath,
+            TotalChunks: totalChunks,
+            Received:    make(map[int]bool),
+            TempFile:    tempFile,
+        }
+        activeUploads[uploadID] = upload
+        log.Printf("Created new upload for %s", fileName)
+    }
+
+    // Get chunk data
+    chunk, _, err := r.FormFile("chunk")
+    if err != nil {
+        log.Printf("Error getting chunk file: %v", err)
+        http.Error(w, "No chunk data received", http.StatusBadRequest)
+        return
+    }
+    defer chunk.Close()
+
+    // Write chunk data at correct offset
+    offset := int64(chunkNumber * chunkSize)
+    data, err := io.ReadAll(chunk)
+    if err != nil {
+        log.Printf("Error reading chunk data: %v", err)
+        http.Error(w, "Failed to read chunk", http.StatusInternalServerError)
+        return
+    }
+
+    if _, err := upload.TempFile.WriteAt(data, offset); err != nil {
+        log.Printf("Error writing chunk: %v", err)
+        http.Error(w, "Failed to write chunk", http.StatusInternalServerError)
+        return
+    }
+
+    upload.Received[chunkNumber] = true
+    log.Printf("Successfully wrote chunk %d/%d for %s", chunkNumber+1, totalChunks, fileName)
+
+    // Check if upload is complete
+    if len(upload.Received) == totalChunks {
+        upload.TempFile.Close()
+        tempPath := upload.TempFile.Name()
+        
+        log.Printf("Upload complete, moving %s to %s", tempPath, targetPath)
+        
+        if err := os.Rename(tempPath, targetPath); err != nil {
+            log.Printf("Error moving file: %v", err)
+            http.Error(w, "Failed to finalize upload", http.StatusInternalServerError)
+            return
+        }
+
+        delete(activeUploads, uploadID)
+        
+        if info, err := os.Stat(targetPath); err == nil {
+            logOperation("UPLOAD", fileName, info.Size())
+        }
+        
+        w.WriteHeader(http.StatusOK)
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "success": true,
+            "file":    fileName,
+        })
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "chunksReceived": len(upload.Received),
+        "totalChunks":   totalChunks,
+    })
+}
+
+func handleBatchDelete(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    var paths []string
+    if err := json.NewDecoder(r.Body).Decode(&paths); err != nil {
+        http.Error(w, "Invalid request", http.StatusBadRequest)
+        return
+    }
+
+    results := make(map[string]string)
+    for _, path := range paths {
+        fullPath := filepath.Join(uploadDir, path)
+        
+        // Validate path
+        absUploadDir, _ := filepath.Abs(uploadDir)
+        absPath, _ := filepath.Abs(fullPath)
+        if !strings.HasPrefix(absPath, absUploadDir) {
+            results[path] = "Invalid path"
+            continue
+        }
+
+        info, err := os.Stat(fullPath)
+        if err != nil {
+            results[path] = "Not found"
+            continue
+        }
+
+        if err := os.RemoveAll(fullPath); err != nil {
+            results[path] = "Failed to delete"
+            continue
+        }
+
+        logOperation("DELETE", path, info.Size())
+        results[path] = "success"
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(results)
 }
 
 func getMimeType(filepath string) string {
