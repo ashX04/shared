@@ -32,6 +32,8 @@ const (
     tempDir = "./uploads/temp"   // Add temporary directory for chunks
     maxNetworkRetries = 3
     networkRetryDelay = 100 * time.Millisecond
+    videoChunkSize = 64 * 1024 * 1024  // 64MB chunks for videos
+    maxVideoWorkers = 8                 // Maximum parallel video chunk processors
 )
 
 type FileInfo struct {
@@ -112,16 +114,74 @@ func (p *UploadWorkerPool) Wait() {
 
 var (
     uploadQueue chan UploadTask
-    activeUploads = make(map[string]*ActiveUpload)
+    activeUploads = make(map[string]ActiveUploader)
     activeUploadsMutex sync.RWMutex // Add mutex for map access
     uploadSemaphore = make(chan struct{}, maxConcurrentUploads) // Add rate limiter for uploads
 )
 
+type ActiveUploader interface {
+    GetTempFile() *os.File
+    GetReceived() map[int]bool
+    GetTargetPath() string
+    IsVideoUpload() bool
+    ProcessChunk(chunk io.Reader, chunkNumber int) error
+}
+
+// Modify ActiveUpload to implement ActiveUploader
 type ActiveUpload struct {
     TargetPath  string
     TotalChunks int
     Received    map[int]bool
     TempFile    *os.File
+}
+
+func (a *ActiveUpload) GetTempFile() *os.File { return a.TempFile }
+func (a *ActiveUpload) GetReceived() map[int]bool { return a.Received }
+func (a *ActiveUpload) GetTargetPath() string { return a.TargetPath }
+func (a *ActiveUpload) IsVideoUpload() bool { return false }
+func (a *ActiveUpload) ProcessChunk(chunk io.Reader, chunkNumber int) error {
+    buffer := make([]byte, bufferSize)
+    offset := int64(chunkNumber * chunkSize)
+    
+    writer := &offsetWriter{
+        file:   a.TempFile,
+        offset: offset,
+        buffer: buffer,
+    }
+    
+    _, err := io.CopyBuffer(writer, chunk, buffer)
+    return err
+}
+
+// Modify VideoUpload to implement ActiveUploader
+type VideoUpload struct {
+    *ActiveUpload
+    ChunkPool   *sync.Pool
+    Workers     chan struct{}
+}
+
+func (v *VideoUpload) IsVideoUpload() bool { return true }
+func (v *VideoUpload) ProcessChunk(chunk io.Reader, chunkNumber int) error {
+    select {
+    case v.Workers <- struct{}{}:
+        defer func() { <-v.Workers }()
+    default:
+        time.Sleep(100 * time.Millisecond)
+        v.Workers <- struct{}{}
+        defer func() { <-v.Workers }()
+    }
+
+    buffer := v.ChunkPool.Get().([]byte)
+    defer v.ChunkPool.Put(buffer)
+    
+    writer := &offsetWriter{
+        file:   v.TempFile,
+        offset: int64(chunkNumber * videoChunkSize),
+        buffer: buffer,
+    }
+
+    _, err := io.CopyBuffer(writer, chunk, buffer)
+    return err
 }
 
 func init() {
@@ -714,6 +774,13 @@ func handleChunkUpload(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    // Check if file is video
+    isVideo := isVideoFile(fileName)
+    actualChunkSize := chunkSize
+    if isVideo {
+        actualChunkSize = videoChunkSize
+    }
+
     // Use RLock for reading
     activeUploadsMutex.RLock()
     upload, exists := activeUploads[uploadID]
@@ -738,15 +805,26 @@ func handleChunkUpload(w http.ResponseWriter, r *http.Request) {
             }
 
             if totalChunks > 0 {
-                tempFile.Truncate(int64(totalChunks * chunkSize))
+                tempFile.Truncate(int64(totalChunks * actualChunkSize))
             }
 
-            upload = &ActiveUpload{
+            baseUpload := &ActiveUpload{
                 TargetPath:  targetPath,
                 TotalChunks: totalChunks,
                 Received:    make(map[int]bool),
                 TempFile:    tempFile,
             }
+
+            if isVideo {
+                upload = &VideoUpload{
+                    ActiveUpload: baseUpload,
+                    ChunkPool:   &sync.Pool{New: func() interface{} { return make([]byte, videoChunkSize) }},
+                    Workers:     make(chan struct{}, maxVideoWorkers),
+                }
+            } else {
+                upload = baseUpload
+            }
+            
             activeUploads[uploadID] = upload
         }
         activeUploadsMutex.Unlock()
@@ -760,38 +838,25 @@ func handleChunkUpload(w http.ResponseWriter, r *http.Request) {
     }
     defer chunk.Close()
 
-    // Use buffered write
-    buffer := make([]byte, bufferSize)
-    offset := int64(chunkNumber * chunkSize)
-    
-    writer := &offsetWriter{
-        file:   upload.TempFile,
-        offset: offset,
-        buffer: buffer,
-    }
-    
-    err = withRetry(func() error {
-        _, err := io.CopyBuffer(writer, chunk, buffer)
-        return err
-    })
-
+    // Process chunk using interface
+    err = upload.ProcessChunk(chunk, chunkNumber)
     if err != nil {
         log.Printf("Error writing chunk: %v", err)
         http.Error(w, "Failed to write chunk", http.StatusInternalServerError)
         return
     }
 
-    upload.Received[chunkNumber] = true
+    upload.GetReceived()[chunkNumber] = true
 
     // Check if upload is complete
-    if len(upload.Received) == totalChunks {
-        upload.TempFile.Sync() // Ensure all data is written
-        upload.TempFile.Close()
+    if len(upload.GetReceived()) == totalChunks {
+        upload.GetTempFile().Sync()
+        upload.GetTempFile().Close()
         
         // Move file with retry
         var moveErr error
         for i := 0; i < maxRetries; i++ {
-            moveErr = os.Rename(upload.TempFile.Name(), targetPath)
+            moveErr = os.Rename(upload.GetTempFile().Name(), upload.GetTargetPath())
             if moveErr == nil {
                 break
             }
@@ -822,7 +887,7 @@ func handleChunkUpload(w http.ResponseWriter, r *http.Request) {
 
     w.WriteHeader(http.StatusOK)
     json.NewEncoder(w).Encode(map[string]interface{}{
-        "chunksReceived": len(upload.Received),
+        "chunksReceived": len(upload.GetReceived()),
         "totalChunks":   totalChunks,
     })
 }
@@ -895,7 +960,7 @@ func handleBatchDelete(w http.ResponseWriter, r *http.Request) {
 func getMimeType(filepath string) string {
     ext := path.Ext(filepath)
     mimeType := mime.TypeByExtension(ext)
-    if mimeType == "" {
+    if (mimeType == "") {
         mimeType = "application/octet-stream"
     }
     return mimeType
@@ -980,7 +1045,7 @@ func cleanupTempFiles() {
         // Skip if file is part of active upload
         isActive := false
         for _, upload := range activeUploads {
-            if strings.Contains(file.Name(), filepath.Base(upload.TempFile.Name())) {
+            if strings.Contains(file.Name(), filepath.Base(upload.GetTempFile().Name())) {
                 isActive = true
                 break
             }
@@ -1007,4 +1072,21 @@ func calculateDirSize(path string) (int64, error) {
         return nil
     })
     return size, err
+}
+
+// Add new helper function
+func isVideoFile(filename string) bool {
+    ext := strings.ToLower(path.Ext(filename))
+    videoExts := map[string]bool{
+        ".mp4":  true,
+        ".avi":  true,
+        ".mkv":  true,
+        ".mov":  true,
+        ".wmv":  true,
+        ".flv":  true,
+        ".webm": true,
+        ".m4v":  true,
+        ".3gp":  true,
+    }
+    return videoExts[ext]
 }
