@@ -273,6 +273,12 @@
                     <input type="hidden" name="path" value="{{.Path}}">
                     <input type="file" name="files" multiple style="display: none" id="fileInput">
                 </form>
+                <div id="uploadProgress" style="display: none; width: 100%; max-width: 300px; margin: 10px auto;">
+                    <div class="progress-bar" style="width: 100%; height: 20px; background: #f0f0f0; border-radius: 10px; overflow: hidden;">
+                        <div id="progressFill" style="width: 0%; height: 100%; background: var(--primary-color); transition: width 0.3s;"></div>
+                    </div>
+                    <div id="uploadStatus" style="margin-top: 5px; font-size: 0.9em; color: #666;"></div>
+                </div>
             </div>
 
             <div class="files-list" style="display: none;">
@@ -475,29 +481,87 @@
                 e.preventDefault();
                 dropZone.classList.remove('drag-over');
                 
-                // Check if this is an internal drag (file move)
                 const srcPath = e.dataTransfer.getData('text/plain');
                 if (srcPath) {
-                    // This is a move operation
                     moveToHome(srcPath);
                 } else {
-                    // This is a file upload
                     const files = e.dataTransfer.files;
-                    const formData = new FormData(uploadForm);
-                    for (let file of files) {
-                        formData.append('files', file);
-                    }
-                    
-                    fetch('/upload', {
-                        method: 'POST',
-                        body: formData
-                    }).then(() => window.location.reload());
+                    uploadFiles(files);
                 }
             });
 
             fileInput.addEventListener('change', () => {
-                uploadForm.submit();
+                uploadFiles(fileInput.files);
             });
+
+            // Add this new function for file upload handling
+            function uploadFiles(files) {
+                const formData = new FormData(uploadForm);
+                let totalSize = 0;
+                let uploadedSize = 0;
+                
+                // Remove existing files from FormData
+                for (let pair of formData.entries()) {
+                    if (pair[0] === 'files') {
+                        formData.delete(pair[0]);
+                    }
+                }
+                
+                // Add files and calculate total size
+                for (let file of files) {
+                    formData.append('files', file);
+                    totalSize += file.size;
+                }
+                
+                console.log(`Starting upload of ${files.length} files, total size: ${formatSize(totalSize)}`);
+                
+                const progressBar = document.getElementById('uploadProgress');
+                const progressFill = document.getElementById('progressFill');
+                const uploadStatus = document.getElementById('uploadStatus');
+                
+                progressBar.style.display = 'block';
+                progressFill.style.width = '0%';
+                uploadStatus.textContent = 'Starting upload...';
+            
+                const xhr = new XMLHttpRequest();
+                xhr.upload.addEventListener('progress', (e) => {
+                    if (e.lengthComputable) {
+                        const percent = (e.loaded / e.total) * 100;
+                        progressFill.style.width = percent + '%';
+                        uploadStatus.textContent = `Uploading: ${formatSize(e.loaded)} / ${formatSize(e.total)} (${percent.toFixed(1)}%)`;
+                        console.log(`Upload progress: ${percent.toFixed(1)}%`);
+                    }
+                });
+            
+                xhr.addEventListener('load', () => {
+                    if (xhr.status === 200) {
+                        console.log('Upload completed successfully');
+                        uploadStatus.textContent = 'Upload completed!';
+                        setTimeout(() => {
+                            window.location.reload();
+                        }, 1000);
+                    } else {
+                        console.error('Upload failed:', xhr.statusText);
+                        uploadStatus.textContent = 'Upload failed: ' + xhr.statusText;
+                    }
+                });
+            
+                xhr.addEventListener('error', () => {
+                    console.error('Upload failed');
+                    uploadStatus.textContent = 'Upload failed. Please try again.';
+                });
+            
+                xhr.open('POST', '/upload');
+                xhr.send(formData);
+            }
+            
+            // Add this utility function for formatting file sizes
+            function formatSize(bytes) {
+                const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+                if (bytes === 0) return '0 B';
+                const i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
+                return Math.round(bytes / Math.pow(1024, i), 2) + ' ' + sizes[i];
+            }
 
             // Update drag and drop for files/folders
             document.querySelectorAll('.file-item').forEach(item => {

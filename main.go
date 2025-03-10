@@ -214,6 +214,16 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    // Enable CORS for XHR requests
+    w.Header().Set("Access-Control-Allow-Origin", "*")
+    w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+    w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+    if r.Method == "OPTIONS" {
+        w.WriteHeader(http.StatusOK)
+        return
+    }
+
     currentPath := r.FormValue("path")
     if currentPath == "" {
         currentPath = "."
@@ -224,6 +234,8 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
     currentPath = strings.TrimPrefix(currentPath, "/")
     targetDir := filepath.Join(uploadDir, currentPath)
     
+    log.Printf("Upload started to directory: %s", targetDir)
+
     // Ensure target directory exists
     if err := os.MkdirAll(targetDir, 0755); err != nil {
         log.Printf("Error creating upload directory: %v", err)
@@ -231,34 +243,43 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    absUploadDir, _ := filepath.Abs(uploadDir)
-    absTargetDir, _ := filepath.Abs(targetDir)
-    if !strings.HasPrefix(absTargetDir, absUploadDir) {
-        http.Error(w, "Invalid path", http.StatusBadRequest)
+    // Use 32MB max memory before writing to disk
+    if err := r.ParseMultipartForm(32 << 20); err != nil {
+        log.Printf("Error parsing multipart form: %v", err)
+        http.Error(w, "Error processing upload", http.StatusBadRequest)
         return
     }
 
-    r.ParseMultipartForm(32 << 20)
     files := r.MultipartForm.File["files"]
+    log.Printf("Received %d files for upload", len(files))
 
-    for _, fileHeader := range files {
+    for i, fileHeader := range files {
         file, err := fileHeader.Open()
         if err != nil {
-            log.Printf("Error opening uploaded file: %v", err)
+            log.Printf("Error opening uploaded file %s: %v", fileHeader.Filename, err)
             continue
         }
-        defer file.Close()
 
         dst, err := os.Create(filepath.Join(targetDir, fileHeader.Filename))
         if err != nil {
-            log.Printf("Error creating file: %v", err)
+            log.Printf("Error creating file %s: %v", fileHeader.Filename, err)
+            file.Close()
             continue
         }
-        defer dst.Close()
-        io.Copy(dst, file)
+
+        written, err := io.Copy(dst, file)
+        if err != nil {
+            log.Printf("Error writing file %s: %v", fileHeader.Filename, err)
+        } else {
+            log.Printf("Successfully uploaded file %d/%d: %s (%d bytes)", i+1, len(files), fileHeader.Filename, written)
+        }
+
+        file.Close()
+        dst.Close()
     }
 
-    http.Redirect(w, r, "/?path="+url.QueryEscape(currentPath), http.StatusSeeOther)
+    log.Printf("Upload completed for %d files", len(files))
+    w.WriteHeader(http.StatusOK)
 }
 
 func handleFileServing(w http.ResponseWriter, r *http.Request) {
