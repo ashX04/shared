@@ -6,6 +6,7 @@ import (
     "io"
     "log"
     "mime"
+    "mime/multipart"  // Add this line
     "net"
     "net/http"
     "os"
@@ -15,9 +16,32 @@ import (
     "github.com/skip2/go-qrcode"
     "path"
     "net/url"
+    "bufio"
+    //"bytes"
+    "runtime"
+    "sync"
+    "sync/atomic"
 )
 
 const uploadDir = "./uploads"
+
+const (
+    copyBufferSize = 4 * 1024 * 1024 // 4MB buffer size
+)
+
+var (
+    bufferPool = sync.Pool{
+        New: func() interface{} {
+            return make([]byte, copyBufferSize)
+        },
+    }
+    
+    // Performance metrics
+    uploadedBytes int64
+    uploadCount   int64
+    uploadErrors  int64
+    avgSpeed     float64
+)
 
 type FileInfo struct {
     Name      string
@@ -35,11 +59,17 @@ type ViewData struct {
     Path       string
     Breadcrumb []BreadcrumbItem
     Parent     string
+    Stats      FolderStats    // Add this line
 }
 
 type BreadcrumbItem struct {
     Name string
     Path string
+}
+
+type FolderStats struct {
+    FileCount int64
+    TotalSize int64
 }
 
 func init() {
@@ -165,11 +195,15 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
         }
     }
 
+    // Get folder statistics
+    stats := getFolderStats(fullPath)
+
     viewData := ViewData{
         Files:      fileInfos,
         Path:       currentPath,
         Breadcrumb: breadcrumb,
         Parent:     filepath.Dir(currentPath),
+        Stats:      stats,          // Add this line
     }
 
     funcMap := template.FuncMap{
@@ -243,7 +277,6 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Use 32MB max memory before writing to disk
     if err := r.ParseMultipartForm(32 << 20); err != nil {
         log.Printf("Error parsing multipart form: %v", err)
         http.Error(w, "Error processing upload", http.StatusBadRequest)
@@ -253,32 +286,105 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
     files := r.MultipartForm.File["files"]
     log.Printf("Received %d files for upload", len(files))
 
-    for i, fileHeader := range files {
-        file, err := fileHeader.Open()
-        if err != nil {
-            log.Printf("Error opening uploaded file %s: %v", fileHeader.Filename, err)
-            continue
-        }
+    // Create channels for work distribution and results
+    jobs := make(chan *multipart.FileHeader, len(files))
+    results := make(chan error, len(files))
+    
+    // Create worker pool (50 workers)
+    for i := 0; i < runtime.NumCPU(); i++ {
+        go func(workerID int) {
+            for fileHeader := range jobs {
+                start := time.Now()
+                
+                // Get a buffer from the pool
+                buf := bufferPool.Get().([]byte)
+                defer bufferPool.Put(buf)
 
-        dst, err := os.Create(filepath.Join(targetDir, fileHeader.Filename))
-        if err != nil {
-            log.Printf("Error creating file %s: %v", fileHeader.Filename, err)
-            file.Close()
-            continue
-        }
+                // Create a pipe for streaming
+                pr, pw := io.Pipe()
+                
+                // Start the writer goroutine
+                go func() {
+                    defer pw.Close()
+                    file, err := fileHeader.Open()
+                    if err != nil {
+                        log.Printf("Worker %d: Error opening file: %v", workerID, err)
+                        atomic.AddInt64(&uploadErrors, 1)
+                        pw.CloseWithError(err)
+                        return
+                    }
+                    defer file.Close()
 
-        written, err := io.Copy(dst, file)
-        if err != nil {
-            log.Printf("Error writing file %s: %v", fileHeader.Filename, err)
-        } else {
-            log.Printf("Successfully uploaded file %d/%d: %s (%d bytes)", i+1, len(files), fileHeader.Filename, written)
-        }
+                    // Use buffered writer for better performance
+                    bw := bufio.NewWriterSize(pw, copyBufferSize)
+                    _, err = io.CopyBuffer(bw, file, buf)
+                    if err != nil {
+                        atomic.AddInt64(&uploadErrors, 1)
+                        pw.CloseWithError(err)
+                        return
+                    }
+                    bw.Flush()
+                }()
 
-        file.Close()
-        dst.Close()
+                // Create the destination file
+                dst, err := os.Create(filepath.Join(targetDir, fileHeader.Filename))
+                if err != nil {
+                    log.Printf("Worker %d: Error creating file: %v", workerID, err)
+                    atomic.AddInt64(&uploadErrors, 1)
+                    results <- err
+                    continue
+                }
+
+                // Use buffered writer for the destination
+                bw := bufio.NewWriterSize(dst, copyBufferSize)
+                written, err := io.CopyBuffer(bw, pr, buf)
+                
+                if err != nil {
+                    log.Printf("Worker %d: Error writing file: %v", workerID, err)
+                    atomic.AddInt64(&uploadErrors, 1)
+                    results <- err
+                } else {
+                    bw.Flush()
+                    duration := time.Since(start)
+                    recordMetrics(written, duration)
+                    log.Printf("Worker %d: Successfully uploaded %s (%s) in %v, speed: %.2f MB/s",
+                        workerID,
+                        fileHeader.Filename,
+                        formatFileSize(written),
+                        duration,
+                        float64(written)/(1024*1024)/duration.Seconds(),
+                    )
+                    results <- nil
+                }
+                dst.Close()
+            }
+        }(i)
     }
 
-    log.Printf("Upload completed for %d files", len(files))
+    // Send jobs to workers
+    go func() {
+        for _, fileHeader := range files {
+            jobs <- fileHeader
+        }
+        close(jobs)
+    }()
+
+    // Collect results
+    var uploadErrors []error
+    for i := 0; i < len(files); i++ {
+        if err := <-results; err != nil {
+            uploadErrors = append(uploadErrors, err)
+        }
+    }
+
+    if len(uploadErrors) > 0 {
+        log.Printf("Upload completed with %d errors", len(uploadErrors))
+        http.Error(w, fmt.Sprintf("Upload completed with %d errors", len(uploadErrors)), http.StatusInternalServerError)
+        return
+    }
+
+    log.Printf("Upload completed successfully for %d files", len(files))
+    log.Printf("Upload session completed. %s", getMetrics())
     w.WriteHeader(http.StatusOK)
 }
 
@@ -450,4 +556,39 @@ func getLocalIP() string {
         }
     }
     return "127.0.0.1"
+}
+
+func getFolderStats(path string) FolderStats {
+    var stats FolderStats
+    filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+        if err != nil {
+            return filepath.SkipDir
+        }
+        if !info.IsDir() {
+            stats.FileCount++
+            stats.TotalSize += info.Size()
+        }
+        return nil
+    })
+    return stats
+}
+
+func recordMetrics(size int64, duration time.Duration) {
+    atomic.AddInt64(&uploadedBytes, size)
+    atomic.AddInt64(&uploadCount, 1)
+    
+    // Calculate speed in MB/s
+    speed := float64(size) / (1024 * 1024) / duration.Seconds()
+    // Update moving average
+    avgSpeed = (avgSpeed*0.9 + speed*0.1)
+}
+
+func getMetrics() string {
+    return fmt.Sprintf(
+        "Total: %s, Count: %d, Errors: %d, Avg Speed: %.2f MB/s",
+        formatFileSize(atomic.LoadInt64(&uploadedBytes)),
+        atomic.LoadInt64(&uploadCount),
+        atomic.LoadInt64(&uploadErrors),
+        avgSpeed,
+    )
 }

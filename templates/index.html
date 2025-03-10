@@ -240,6 +240,21 @@
             background: var(--hover-color);
             box-shadow: 0 0 0 2px var(--primary-color);
         }
+
+        .folder-stats {
+            margin-left: auto;
+            padding: 6px 12px;
+            background: var(--bg-gray);
+            border-radius: 6px;
+            font-size: 0.9em;
+            color: #666;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .folder-stats i {
+            color: var(--primary-color);
+        }
     </style>
 </head>
 <body>
@@ -254,6 +269,10 @@
             <button class="view-toggle" onclick="window.createFolder()">
                 <i class="fas fa-folder-plus"></i> New Folder
             </button>
+            <div class="folder-stats">
+                <i class="fas fa-info-circle"></i>
+                {{.Stats.FileCount}} files ({{formatSize .Stats.TotalSize}})
+            </div>
         </div>
 
         <div class="breadcrumb">
