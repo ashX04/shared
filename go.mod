@@ -1,4 +1,4 @@
-module github.com/ashX04/fileserver
+module fileserver
 
 go 1.23.6
 

@@ -21,6 +21,8 @@ import (
     "runtime"
     "sync"
     "sync/atomic"
+    "fileserver/moodboard"
+    "encoding/json"
 )
 
 const uploadDir = "./uploads"
@@ -86,6 +88,9 @@ func init() {
     mime.AddExtensionType(".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     mime.AddExtensionType(".xls", "application/vnd.ms-excel")
     mime.AddExtensionType(".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    os.MkdirAll(moodboard.MoodBoardDir, 0755)
+    os.MkdirAll(moodboard.ThumbnailDir, 0755)
 }
 
 func main() {
@@ -99,6 +104,13 @@ func main() {
     http.Handle("/dav/", logRequest(handleWebDAV))
     http.HandleFunc("/folder", handleCreateFolder)
     http.HandleFunc("/move", handleMove)
+    
+    // Add new moodboard handlers
+    http.HandleFunc("/moodboard/create", handleMoodboardCreate)
+    http.HandleFunc("/moodboard/list", handleMoodboardList)
+    http.HandleFunc("/moodboard/view/", handleMoodboardView)
+    http.HandleFunc("/moodboard/update", handleMoodboardUpdate)
+    http.HandleFunc("/moodboard/delete", handleMoodboardDelete)
     
     ip := getLocalIP()
     port := ":8080"
@@ -591,4 +603,105 @@ func getMetrics() string {
         atomic.LoadInt64(&uploadErrors),
         avgSpeed,
     )
+}
+
+// Add these new handler functions
+func handleMoodboardCreate(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    name := r.FormValue("name")
+    description := r.FormValue("description")
+    
+    board, err := moodboard.NewMoodBoard(name, description)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    
+    if err := board.Save(); err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(board)
+}
+
+func handleMoodboardList(w http.ResponseWriter, r *http.Request) {
+    boards, err := moodboard.ListMoodBoards()
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(boards)
+}
+
+func handleMoodboardView(w http.ResponseWriter, r *http.Request) {
+    id := strings.TrimPrefix(r.URL.Path, "/moodboard/view/")
+    
+    if strings.HasSuffix(r.URL.Path, ".json") {
+        // Return JSON data for API requests
+        board, err := moodboard.GetMoodBoard(id)
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusNotFound)
+            return
+        }
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(board)
+        return
+    }
+
+    // Serve the moodboard template for browser requests
+    tmpl := template.Must(template.ParseFiles("templates/moodboard.html"))
+    if err := tmpl.Execute(w, nil); err != nil {
+        log.Printf("Template error: %v", err)
+        http.Error(w, "Error rendering template", http.StatusInternalServerError)
+    }
+}
+
+func handleMoodboardUpdate(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    id := r.FormValue("id")
+    board, err := moodboard.GetMoodBoard(id)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusNotFound)
+        return
+    }
+
+    // Update moodboard items
+    if err := json.NewDecoder(r.Body).Decode(&board.Items); err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+
+    if err := board.Save(); err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
+}
+
+func handleMoodboardDelete(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodDelete {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    id := r.FormValue("id")
+    if err := moodboard.DeleteMoodBoard(id); err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
 }

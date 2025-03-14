@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Moodboard - File Server</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/interactjs/dist/interact.min.js"></script>
+    <style>
+        .moodboard-canvas {
+            width: 100%;
+            height: calc(100vh - 100px);
+            background: #f0f0f0;
+            position: relative;
+            overflow: auto;
+        }
+
+        .moodboard-item {
+            position: absolute;
+            background: white;
+            border: 1px solid #ccc;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            cursor: move;
+            user-select: none;
+            transform-origin: center;
+        }
+
+        .moodboard-item img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .resize-handle {
+            width: 10px;
+            height: 10px;
+            background: #fff;
+            border: 1px solid #0366d6;
+            position: absolute;
+            right: -5px;
+            bottom: -5px;
+            cursor: se-resize;
+        }
+
+        .rotate-handle {
+            width: 20px;
+            height: 20px;
+            position: absolute;
+            top: -25px;
+            left: 50%;
+            transform: translateX(-50%);
+            cursor: grab;
+            color: #0366d6;
+        }
+
+        .toolbar {
+            padding: 10px;
+            background: white;
+            border-bottom: 1px solid #e1e4e8;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .toolbar button {
+            padding: 5px 10px;
+            border: 1px solid #e1e4e8;
+            border-radius: 4px;
+            background: white;
+            cursor: pointer;
+        }
+
+        .toolbar button:hover {
+            background: #f0f5ff;
+            border-color: #0366d6;
+        }
+    </style>
+</head>
+<body>
+    <div class="toolbar">
+        <button onclick="history.back()"><i class="fas fa-arrow-left"></i> Back</button>
+        <button onclick="addImage()"><i class="fas fa-plus"></i> Add Image</button>
+        <button onclick="saveMoodboard()"><i class="fas fa-save"></i> Save</button>
+        <input type="file" id="imageInput" style="display: none" accept="image/*" multiple>
+    </div>
+
+    <div class="moodboard-canvas" id="canvas"></div>
+
+    <script>
+        // Moodboard interaction code
+        interact('.moodboard-item')
+            .draggable({
+                inertia: true,
+                modifiers: [
+                    interact.modifiers.restrictRect({
+                        restriction: 'parent',
+                        endOnly: true
+                    })
+                ],
+                onmove: dragMoveListener
+            })
+            .resizable({
+                edges: { right: true, bottom: true, left: true, top: true }
+            })
+            .on('resizemove', function (event) {
+                var target = event.target;
+                var x = (parseFloat(target.getAttribute('data-x')) || 0);
+                var y = (parseFloat(target.getAttribute('data-y')) || 0);
+
+                target.style.width = event.rect.width + 'px';
+                target.style.height = event.rect.height + 'px';
+
+                x += event.deltaRect.left;
+                y += event.deltaRect.top;
+
+                target.style.transform = 'translate(' + x + 'px,' + y + 'px)';
+                target.setAttribute('data-x', x);
+                target.setAttribute('data-y', y);
+            });
+
+        function dragMoveListener(event) {
+            var target = event.target;
+            var x = (parseFloat(target.getAttribute('data-x')) || 0) + event.dx;
+            var y = (parseFloat(target.getAttribute('data-y')) || 0) + event.dy;
+
+            target.style.transform = `translate(${x}px, ${y}px)`;
+            target.setAttribute('data-x', x);
+            target.setAttribute('data-y', y);
+        }
+
+        // Add image to moodboard
+        function addImage() {
+            document.getElementById('imageInput').click();
+        }
+
+        document.getElementById('imageInput').addEventListener('change', function(e) {
+            Array.from(e.target.files).forEach(file => {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    createMoodboardItem(e.target.result);
+                };
+                reader.readAsDataURL(file);
+            });
+        });
+
+        function createMoodboardItem(imageUrl) {
+            const item = document.createElement('div');
+            item.className = 'moodboard-item';
+            item.innerHTML = `
+                <img src="${imageUrl}">
+                <div class="resize-handle"></div>
+                <div class="rotate-handle"><i class="fas fa-sync-alt"></i></div>
+            `;
+            item.style.width = '200px';
+            item.style.height = '200px';
+            document.getElementById('canvas').appendChild(item);
+        }
+
+        // Save moodboard state
+        function saveMoodboard() {
+            const items = Array.from(document.querySelectorAll('.moodboard-item')).map(item => ({
+                x: parseFloat(item.getAttribute('data-x')) || 0,
+                y: parseFloat(item.getAttribute('data-y')) || 0,
+                width: parseInt(item.style.width),
+                height: parseInt(item.style.height),
+                imageSrc: item.querySelector('img').src
+            }));
+
+            fetch('/moodboard/update', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(items)
+            }).then(response => {
+                if (response.ok) {
+                    alert('Moodboard saved successfully!');
+                } else {
+                    alert('Error saving moodboard');
+                }
+            });
+        }
+    </script>
+</body>
+</html>
