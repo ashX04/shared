@@ -7,11 +7,24 @@
     <script src="https://cdn.jsdelivr.net/npm/interactjs/dist/interact.min.js"></script>
     <style>
         .moodboard-canvas {
+            width: 4000px;
+            height: 4000px;
+            background: 
+                linear-gradient(45deg, #f0f0f0 25%, transparent 25%),
+                linear-gradient(-45deg, #f0f0f0 25%, transparent 25%),
+                linear-gradient(45deg, transparent 75%, #f0f0f0 75%),
+                linear-gradient(-45deg, transparent 75%, #f0f0f0 75%);
+            background-size: 20px 20px;
+            position: relative;
+            transform-origin: 0 0;
+        }
+
+        .canvas-container {
             width: 100%;
             height: calc(100vh - 100px);
-            background: #f0f0f0;
-            position: relative;
             overflow: auto;
+            position: relative;
+            cursor: grab;
         }
 
         .moodboard-item {
@@ -22,6 +35,12 @@
             cursor: move;
             user-select: none;
             transform-origin: center;
+            outline: 2px solid transparent;
+            transition: outline-color 0.2s;
+        }
+
+        .moodboard-item.selected {
+            outline: 2px solid #0366d6;
         }
 
         .moodboard-item img {
@@ -73,6 +92,29 @@
             background: #f0f5ff;
             border-color: #0366d6;
         }
+
+        .zoom-controls {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            padding: 8px;
+            display: flex;
+            gap: 8px;
+        }
+
+        .shortcuts-help {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            background: white;
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            font-size: 0.9em;
+        }
     </style>
 </head>
 <body>
@@ -80,10 +122,29 @@
         <button onclick="history.back()"><i class="fas fa-arrow-left"></i> Back</button>
         <button onclick="addImage()"><i class="fas fa-plus"></i> Add Image</button>
         <button onclick="saveMoodboard()"><i class="fas fa-save"></i> Save</button>
+        <button onclick="arrangeSelected()"><i class="fas fa-th"></i> Arrange Selected</button>
+        <button onclick="selectAll()"><i class="fas fa-check-double"></i> Select All</button>
         <input type="file" id="imageInput" style="display: none" accept="image/*" multiple>
     </div>
 
-    <div class="moodboard-canvas" id="canvas"></div>
+    <div class="canvas-container">
+        <div class="moodboard-canvas" id="canvas"></div>
+    </div>
+
+    <div class="zoom-controls">
+        <button onclick="adjustZoom(0.1)"><i class="fas fa-plus"></i></button>
+        <button onclick="adjustZoom(-0.1)"><i class="fas fa-minus"></i></button>
+        <button onclick="resetZoom()"><i class="fas fa-sync"></i></button>
+    </div>
+
+    <div class="shortcuts-help">
+        <strong>Shortcuts:</strong><br>
+        Ctrl+A: Select All<br>
+        Del: Delete Selected<br>
+        G: Grid Arrange<br>
+        Click + Drag: Pan Canvas<br>
+        Shift+Click: Multi Select
+    </div>
 
     <script>
         // Moodboard interaction code
@@ -152,7 +213,16 @@
             `;
             item.style.width = '200px';
             item.style.height = '200px';
-            document.getElementById('canvas').appendChild(item);
+            
+            // Random initial position within visible area
+            const x = Math.random() * (window.innerWidth - 300);
+            const y = Math.random() * (window.innerHeight - 300);
+            item.style.transform = `translate(${x}px, ${y}px)`;
+            item.setAttribute('data-x', x);
+            item.setAttribute('data-y', y);
+            
+            canvas.appendChild(item);
+            return item;
         }
 
         // Save moodboard state
@@ -177,6 +247,114 @@
                 } else {
                     alert('Error saving moodboard');
                 }
+            });
+        }
+
+        let scale = 1;
+        let isDragging = false;
+        let startX, startY, scrollLeft, scrollTop;
+        const container = document.querySelector('.canvas-container');
+        const canvas = document.getElementById('canvas');
+        
+        // Pan functionality
+        container.addEventListener('mousedown', (e) => {
+            if (e.target === canvas) {
+                isDragging = true;
+                startX = e.pageX - container.offsetLeft;
+                startY = e.pageY - container.offsetTop;
+                scrollLeft = container.scrollLeft;
+                scrollTop = container.scrollTop;
+            }
+        });
+
+        container.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            e.preventDefault();
+            const x = e.pageX - container.offsetLeft;
+            const y = e.pageY - container.offsetTop;
+            const walkX = (x - startX) * 1;
+            const walkY = (y - startY) * 1;
+            container.scrollLeft = scrollLeft - walkX;
+            container.scrollTop = scrollTop - walkY;
+        });
+
+        container.addEventListener('mouseup', () => {
+            isDragging = false;
+        });
+
+        // Zoom functionality
+        function adjustZoom(delta) {
+            scale = Math.min(Math.max(0.1, scale + delta), 3);
+            canvas.style.transform = `scale(${scale})`;
+        }
+
+        function resetZoom() {
+            scale = 1;
+            canvas.style.transform = `scale(${scale})`;
+        }
+
+        // Selection functionality
+        let selectedItems = new Set();
+
+        document.addEventListener('click', (e) => {
+            const item = e.target.closest('.moodboard-item');
+            if (!item) return;
+            
+            if (!e.shiftKey) {
+                selectedItems.forEach(i => i.classList.remove('selected'));
+                selectedItems.clear();
+            }
+            
+            item.classList.toggle('selected');
+            if (item.classList.contains('selected')) {
+                selectedItems.add(item);
+            } else {
+                selectedItems.delete(item);
+            }
+        });
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Delete') {
+                selectedItems.forEach(item => {
+                    item.remove();
+                });
+                selectedItems.clear();
+            } else if (e.key === 'a' && e.ctrlKey) {
+                e.preventDefault();
+                selectAll();
+            } else if (e.key === 'g') {
+                arrangeSelected();
+            }
+        });
+
+        function selectAll() {
+            selectedItems.clear();
+            document.querySelectorAll('.moodboard-item').forEach(item => {
+                item.classList.add('selected');
+                selectedItems.add(item);
+            });
+        }
+
+        function arrangeSelected() {
+            const items = Array.from(selectedItems);
+            if (items.length === 0) return;
+
+            const cols = Math.ceil(Math.sqrt(items.length));
+            const spacing = 20;
+            const itemWidth = 200;
+            const itemHeight = 200;
+
+            items.forEach((item, index) => {
+                const row = Math.floor(index / cols);
+                const col = index % cols;
+                
+                const x = col * (itemWidth + spacing);
+                const y = row * (itemHeight + spacing);
+
+                item.style.transform = `translate(${x}px, ${y}px)`;
+                item.setAttribute('data-x', x);
+                item.setAttribute('data-y', y);
             });
         }
     </script>
